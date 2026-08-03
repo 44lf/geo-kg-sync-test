@@ -1,0 +1,34 @@
+.git
+.env
+.env.*
+!.env.example
+node_modules
+web/node_modules
+web/dist
+dist
+build
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.venv
+GeoAppData
+.test-data
+.test-debug*
+.playwright-cli
+_tmp_*
+*.db
+*.sqlite
+*.log
+
+# Runtime artifacts — must NEVER be baked into the image.
+# (backups/*.tar.gz were being copied into /app/backups and filled prod disk.)
+backups/
+data/
+exports/
+*.tar
+*.tar.gz
+*.zip
+.claude/
+spike_*.json

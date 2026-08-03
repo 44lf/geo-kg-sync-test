@@ -1,0 +1,286 @@
+"""AI 生文模块路由（问题池 CRUD/同步 + 问题类型聚合）。
+
+注：旧 `POST /sessions` 问题池直连生成已硬切下线，请使用智能体工作流。
+"""
+
+import logging
+from typing import Any, Literal
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from sqlalchemy.orm import Session
+
+from server.app.core.security import get_current_user, require_admin
+from server.app.db.session import get_db
+from server.app.modules.ai_generation import question_bank as qb
+from server.app.modules.ai_generation.schemas import (
+    AiEngineRead,
+    GenerationSessionRead,
+    QuestionBrief,
+    QuestionItemRead,
+    QuestionPoolCreate,
+    QuestionPoolRead,
+    QuestionPoolUpdate,
+    QuestionTypeRead,
+    SyncResult,
+)
+from server.app.modules.ai_generation.service import get_session
+from server.app.modules.audit.service import add_audit_entry
+from server.app.modules.system.models import User
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+
+@router.post("/sessions")
+def start_generation() -> None:
+    """旧问题池直连生成已硬切下线。"""
+    raise HTTPException(
+        status_code=410,
+        detail="问题池直连生成已停用，请使用智能体工作流（/agents）。",
+    )
+
+
+@router.get("/sessions/{session_id}", response_model=GenerationSessionRead)
+def get_generation_status(
+    session_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Any:
+    session = get_session(db, session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    if session.user_id != current_user.id and current_user.role != "admin":
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return session
+
+
+# ── 问题库 ───────────────────────────────────────────────────────────────────
+
+
+def _pool_to_read(pool: Any, pending_count: int) -> QuestionPoolRead:
+    return QuestionPoolRead(
+        id=pool.id,
+        name=pool.name,
+        feishu_app_token=pool.feishu_app_token,
+        feishu_table_id=pool.feishu_table_id,
+        last_synced_at=pool.last_synced_at,
+        created_at=pool.created_at,
+        pending_count=pending_count,
+        auto_sync_enabled=pool.auto_sync_enabled,
+    )
+
+
+def _get_pool_or_404(db: Session, pool_id: int) -> Any:
+    """问题池全员共享：仅在不存在 / 已软删除时 404，不再按属主隔离。"""
+    pool = qb.get_pool(db, pool_id)
+    if pool is None:
+        raise HTTPException(status_code=404, detail="问题池不存在")
+    return pool
+
+
+@router.get("/question-pools", response_model=list[QuestionPoolRead])
+def list_question_pools(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Any:
+    pools = qb.list_pools(db)
+    return [_pool_to_read(p, len(qb.list_items(db, p.id))) for p in pools]
+
+
+@router.post("/question-pools", response_model=QuestionPoolRead, status_code=201)
+def create_question_pool(
+    payload: QuestionPoolCreate,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Any:
+    pool = qb.create_pool(
+        db,
+        user_id=current_user.id,
+        name=payload.name,
+        feishu_app_token=payload.feishu_app_token,
+        feishu_table_id=payload.feishu_table_id,
+    )
+    db.commit()
+    add_audit_entry(
+        db,
+        user=current_user,
+        action="question_pool.create",
+        target_type="question_pool",
+        target_id=pool.id,
+        payload={"name": pool.name},
+        request=request,
+    )
+    return _pool_to_read(pool, 0)
+
+
+@router.post("/question-pools/{pool_id}/sync", response_model=SyncResult)
+def sync_question_pool(
+    pool_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Any:
+    pool = _get_pool_or_404(db, pool_id)
+    result = qb.sync_pool(db, pool)
+    db.commit()
+    add_audit_entry(
+        db,
+        user=current_user,
+        action="question_pool.sync",
+        target_type="question_pool",
+        target_id=pool_id,
+        payload={
+            "total": result.get("total"),
+            "added": result.get("added"),
+            "updated": result.get("updated"),
+            "reactivated": result.get("reactivated"),
+            "deactivated": result.get("deactivated"),
+        },
+        request=request,
+    )
+    return SyncResult(**result)
+
+
+@router.patch("/question-pools/{pool_id}", response_model=QuestionPoolRead)
+def update_question_pool(
+    pool_id: int,
+    payload: QuestionPoolUpdate,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Any:
+    """改名 / 重绑飞书表 / 自动同步开关。问题池共享，任意登录用户均可修改。"""
+    pool = _get_pool_or_404(db, pool_id)
+    qb.update_pool(
+        db,
+        pool,
+        name=payload.name,
+        feishu_app_token=payload.feishu_app_token,
+        feishu_table_id=payload.feishu_table_id,
+        auto_sync_enabled=payload.auto_sync_enabled,
+    )
+    db.commit()
+    db.refresh(pool)
+    add_audit_entry(
+        db,
+        user=current_user,
+        action="question_pool.update",
+        target_type="question_pool",
+        target_id=pool.id,
+        payload={"name": pool.name},
+        request=request,
+    )
+    return _pool_to_read(pool, len(qb.list_items(db, pool.id)))
+
+
+@router.delete("/question-pools/{pool_id}", status_code=204)
+def delete_question_pool(
+    pool_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+) -> None:
+    """删除问题池仅限 admin（软删除）。其他用户可建 / 看 / 改名 / 同步，但不可删。"""
+    pool = _get_pool_or_404(db, pool_id)
+    pool_name = pool.name
+    qb.soft_delete_pool(db, pool)
+    db.commit()
+    add_audit_entry(
+        db,
+        user=current_user,
+        action="question_pool.delete",
+        target_type="question_pool",
+        target_id=pool_id,
+        payload={"name": pool_name},
+        request=request,
+    )
+
+
+@router.get("/question-pools/{pool_id}/items", response_model=list[QuestionItemRead])
+def list_question_items(
+    pool_id: int,
+    status: str = "pending",
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Any:
+    if status not in {"pending", "all", "consumed"}:
+        raise HTTPException(
+            status_code=400,
+            detail="status must be pending, all, or consumed",
+        )
+    if status == "consumed":
+        return []
+    availability: Literal["active", "all"] = "all" if status == "all" else "active"
+    pool = _get_pool_or_404(db, pool_id)
+    return [
+        qb.question_item_to_read(item)
+        for item in qb.list_items(db, pool.id, availability=availability)
+    ]
+
+
+@router.get(
+    "/question-pools/{pool_id}/question-types",
+    response_model=list[QuestionTypeRead],
+)
+def list_question_types(
+    pool_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Any:
+    """按问题类型（category）聚合该池所有 source_active 问题，供方案录入页使用。"""
+    pool = _get_pool_or_404(db, pool_id)
+    return [
+        QuestionTypeRead(
+            question_type=qtype,
+            count=len(items),
+            questions=[QuestionBrief.model_validate(it) for it in items],
+        )
+        for qtype, items in qb.question_types(db, pool.id)
+    ]
+
+
+@router.get("/ai-engines", response_model=list[AiEngineRead])
+def list_ai_engines(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Any:
+    """写作模型下拉（方案编辑器 / Pipeline 用）。
+
+    DB 注册表行优先；同时把 GEO_AI_ENGINES 中尚未被 DB 行接管的 env-only 模型并入下拉。
+    这点很关键：带内联 api_key 的旧 env 模型不会播种进 DB，否则会丢失 per-engine key，
+    但它们仍可由 resolve_writing_engine -> config.resolve_engine 在运行时正确解析。
+    密钥 / base_url 永不下发。
+    """
+    from server.app.core.config import get_settings
+    from server.app.modules.ai_models.service import list_models
+
+    all_db_rows = list_models(db, scope="generation", enabled_only=False)
+    taken_models = {r.model for r in all_db_rows}
+    out = [AiEngineRead(label=r.label, model=r.model) for r in all_db_rows if r.is_enabled]
+    for engine in get_settings().ai_engines:
+        if engine.model in taken_models:
+            continue
+        out.append(AiEngineRead(label=engine.label, model=engine.model))
+        taken_models.add(engine.model)
+    return out
+
+
+@router.get("/format-engines", response_model=list[AiEngineRead])
+def list_format_engines(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Any:
+    """格式·配图模型下拉：DB 注册表 scope=ai_format 的启用行（密钥不下发）。"""
+    from server.app.modules.ai_models.service import list_models
+
+    rows = list_models(db, scope="ai_format", enabled_only=True)
+    return [AiEngineRead(label=r.label, model=r.model) for r in rows]
+
+
+# 历史：曾有一个 MCP-facing POST /compose-once 端点（让 GEO 后端调 LiteLLM 帮 Loop 生文）。
+# 已下线——Loop runner（Claude Code 主对话）直接生文 + 调 articles_mcp_router 的
+# /save-from-mcp 落库，零 GEO_AI_API_KEY 依赖。该路径完全替代 compose-once。
+# 入口在 server/app/modules/articles/router.py:save_article_from_mcp。
+
+mcp_router = APIRouter()

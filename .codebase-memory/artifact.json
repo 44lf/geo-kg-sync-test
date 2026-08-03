@@ -1,0 +1,11 @@
+{
+    "schema_version": 2,
+    "commit": "0709b1ee26c8bc9341607da4a741830b805f8cc3",
+    "indexed_at": "2026-08-03T08:03:40Z",
+    "project": "E-geo",
+    "nodes": 15519,
+    "edges": 65321,
+    "original_size": 38076416,
+    "compressed_size": 8645489,
+    "compression_level": 3
+}

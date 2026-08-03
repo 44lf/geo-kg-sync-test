@@ -1,0 +1,59 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.test-tmp/
+.venv/
+dist/
+build/
+node_modules/
+web/dist/
+web/tsconfig.tsbuildinfo
+.env
+.env.*
+!.env.example
+GeoAppData/
+.test-data/
+.test-debug*/
+.playwright-cli/
+_tmp_*/
+*.db
+*.sqlite
+*.db-shm
+*.db-wal
+*.log
+.claude/
+/.agents/
+
+.devenv.sh
+.devdata/
+
+ai-generation-demo.html
+.codex-output/
+.superpowers/
+.worktrees/
+
+# 本机工作笔记，不入仓
+plan.md
+.workbuddy/
+
+# 本机 VS Code 任务配置（硬编码个人 conda 路径），不入仓
+.vscode/
+
+# 本机 Windows 便捷上线入口（双击跑 deploy.sh），只自己用、不入仓
+deploy.cmd
+
+# 项目文档归档包（不入仓；体系化文档已迁入 docs/）
+doc.rar
+# Spike capture output (live tokens / article ids — never commit)
+spike_result.json
+spike_*_capture.json
+/pc-admin-conetnt-library-public
+/content-library-public
+
+# Pencil demo 生成的图片素材（demo.pen 本地引用，不入仓）
+images/
+
+# 本地参考副本，不提交（见 2026-07-21-xhs-note-creator-design.md）
+Auto-Redbook-Skills-main/

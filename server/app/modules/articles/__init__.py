@@ -1,0 +1,48 @@
+"""文章模块包入口：聚合并重导出 parser / service / store 的公开 API，供 router 等统一从此处导入。"""
+
+from server.app.modules.articles.parser import (  # noqa: F401
+    BodySegment,
+    dumps_content_json,
+    extract_body_image_nodes,
+    has_publishable_body,
+    loads_content_json,
+    parse_body_segments,
+)
+from server.app.modules.articles.service import (  # noqa: F401
+    VALID_ARTICLE_STATUSES,
+    VALID_REVIEW_STATUSES,
+    approve_article,
+    approve_group,
+    compute_group_review_summary,
+    create_article,
+    create_group,
+    delete_article,
+    delete_group,
+    ensure_asset_exists,
+    get_article,
+    get_group,
+    list_article_feed,
+    list_articles,
+    list_groups,
+    replace_group_items,
+    revoke_article_approval,
+    search_by_title,
+    serialize_article_summaries,
+    set_article_cover,
+    sync_article_body_assets,
+    update_article,
+    update_group,
+    validate_article_status,
+)
+from server.app.modules.articles.store import (  # noqa: F401
+    StoredAsset,
+    asset_url,
+    find_orphan_asset_ids,
+    get_asset_stats,
+    guess_image_size,
+    normalize_ext,
+    resolve_asset_path,
+    soft_delete_assets,
+    store_bytes,
+    store_upload,
+)

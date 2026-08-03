@@ -1,0 +1,536 @@
+"""方案运行执行器：展开运行任务 → 并发执行 → 汇总运行状态。
+
+设计要点（对照可行性分析 Q3/Q4）：
+- 三段式：`create_run`（展开快照→待处理任务）/ `run_scheme`（并发执行+汇总）/ 纯函数易测。
+- 每篇文章一条任务，互不依赖，使用 ThreadPoolExecutor(max_workers=4)。
+- 每个并行工作线程自带独立数据库会话（会话非线程安全）。
+- 运行时每条任务从该问题类型允许列表随机抽一个**有效**模板（不存在/停用/删除/非 generation
+  都视为无效）；若整列无效 → 该任务失败、其他类型继续。
+- 只读方案快照（question_text），不碰 QuestionItem.status/article_id。
+"""
+
+from __future__ import annotations
+
+import logging
+import random
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any
+
+from server.app.core.config import get_settings
+from server.app.core.time import utcnow
+from server.app.modules.ai_generation.article_writer import generate_article_from_prompt
+from server.app.modules.ai_generation.models import (
+    GenerationScheme,
+    GenerationSchemeRun,
+    GenerationSchemeRunTask,
+)
+from server.app.modules.ai_generation.runtime_templates import pick_valid_template
+from server.app.modules.ai_generation.scheme_service import get_line_questions, get_lines
+from server.app.modules.articles.ai_format import (
+    all_category_contexts,
+    run_ai_format,
+    run_ai_format_from_game_list,
+)
+from server.app.shared.concurrency import ObservableGate, register_gate
+from server.app.shared.errors import ConflictError
+
+logger = logging.getLogger(__name__)
+
+SessionFactory = Callable[[], Any]
+
+# 活跃运行状态（在途）：建 run 前据此去重、启动期据此复位僵死残留——两处共用同一判定。
+ACTIVE_RUN_STATUSES = ("pending", "running")
+
+# 全局并发闸：限制单进程同时执行的方案运行数（与 pipeline executor 的 _RUN_SEMAPHORE 对称）。
+# 缺它时每次 POST /schemes/{id}/runs 都裸 fork 出 1+4 个线程争抢 DB 连接，连点即耗尽连接池
+# （连接池耗尽事故根因之一）。多于 cap 的运行线程阻塞在信号量上、不持 DB 连接，安全排队。
+_RUN_GATE = register_gate(
+    ObservableGate(max(1, get_settings().scheme_max_concurrent_runs), name="scheme")
+)
+
+# 有界派发线程池（封堵 #5）：方案运行后台线程不再裸 threading.Thread 无界 spawn。活跃去重已挡住
+# 同一 scheme 的重复运行；本池再为「跨 scheme 的并发 POST」兜底——总派发线程数有界，超出的安静
+# 排队（排队项不持 DB 连接）。容量给 gate cap 的 ~2x，让等 _RUN_GATE 的 run 仍能命中 acquire 超时。
+_DISPATCH_POOL = ThreadPoolExecutor(
+    max_workers=max(2, get_settings().scheme_max_concurrent_runs * 2),
+    thread_name_prefix="scheme-dispatch",
+)
+
+
+def _run_acquire_timeout() -> float:
+    return float(get_settings().scheme_run_acquire_timeout_seconds)
+
+
+def _render_questions(questions: list[Any]) -> str:
+    """把方案行的问题快照渲染成编号问题列表。"""
+    lines: list[str] = []
+    for q in questions:
+        text = (q.question_text or "").strip()
+        if text:
+            lines.append(text)
+    return "\n".join(f"{i}. {t}" for i, t in enumerate(lines, start=1))
+
+
+def create_run(db: Any, *, scheme: GenerationScheme, user_id: int) -> GenerationSchemeRun:
+    """按方案行展开运行任务（每行 article_count 条）。使用方案快照，不读问题池最新文本。
+
+    建 run 前先做**活跃去重**（镜像 pipeline create_run）：锁住 scheme 行后查同 scheme 是否已有
+    pending/running 运行，有则抛 ConflictError（→ 409），封堵「连点运行 = 重复 run」。行锁让并发
+    POST 串行化、第二个看到第一个已落库的在途 run。不提交事务，由调用方提交。
+    """
+    db.query(GenerationScheme).filter(GenerationScheme.id == scheme.id).with_for_update().first()
+    active = (
+        db.query(GenerationSchemeRun.id)
+        .filter(
+            GenerationSchemeRun.scheme_id == scheme.id,
+            GenerationSchemeRun.status.in_(ACTIVE_RUN_STATUSES),
+        )
+        .first()
+    )
+    if active is not None:
+        raise ConflictError("该方案已有正在运行的任务，请等待其完成后再运行")
+
+    run = GenerationSchemeRun(
+        scheme_id=scheme.id,
+        user_id=user_id,
+        status="pending",
+        article_ids=[],
+        ai_engine=scheme.ai_engine,
+    )
+    db.add(run)
+    db.flush()
+
+    for line in get_lines(db, scheme.id):
+        questions = get_line_questions(db, line.id)
+        question_text = _render_questions(questions)
+        item_ids = [q.question_item_id for q in questions if q.question_item_id is not None]
+        allowed = list(line.allowed_prompt_template_ids or [])
+        for _ in range(max(0, int(line.article_count or 0))):
+            db.add(
+                GenerationSchemeRunTask(
+                    run_id=run.id,
+                    scheme_line_id=line.id,
+                    question_type=line.question_type,
+                    question_text=question_text,
+                    question_item_ids=item_ids,
+                    allowed_prompt_template_ids=allowed,
+                    status="pending",
+                )
+            )
+    db.flush()
+    return run
+
+
+_pick_valid_template = pick_valid_template
+
+
+def _fail_task(db: Any, task_id: int, message: str) -> None:
+    task = db.get(GenerationSchemeRunTask, task_id)
+    if task is None:
+        return
+    task.status = "failed"
+    task.error_message = message[:1000]
+    task.completed_at = utcnow()
+    db.commit()
+
+
+def _execute_task(
+    task_id: int,
+    user_id: int,
+    session_factory: SessionFactory,
+    model_override: str | None = None,
+    agent_name: str | None = None,
+) -> int | None:
+    """执行一条任务：选模板 → 生文 → 写结果。返回 article_id 或 None（失败）。
+
+    model_override 为方案级 AI 引擎（None / 空 = 用系统默认写作模型）。
+    agent_name 为生文溯源的「智能体」名（方案运行即方案名），落库供列表展示。
+    """
+    db = session_factory()
+    try:
+        task = db.get(GenerationSchemeRunTask, task_id)
+        if task is None:
+            return None
+        task.status = "running"
+        allowed = list(task.allowed_prompt_template_ids or [])
+        question_text = task.question_text or ""
+        db.commit()
+    finally:
+        db.close()
+
+    # 选模板（运行时复核 + 随机），记 actual_prompt_template_id
+    db = session_factory()
+    try:
+        tpl = _pick_valid_template(db, allowed, user_id)
+        if tpl is None:
+            _fail_task(
+                db,
+                task_id,
+                "该问题类型的允许模板在运行时全部无效（不存在/停用/删除/非 generation）",
+            )
+            return None
+        template_content = tpl.content
+        template_name = tpl.name
+        template_id = tpl.id
+        task = db.get(GenerationSchemeRunTask, task_id)
+        task.actual_prompt_template_id = tpl.id
+        db.commit()
+    finally:
+        db.close()
+
+    # 生文
+    try:
+        article_id = generate_article_from_prompt(
+            session_factory=session_factory,
+            user_id=user_id,
+            template_content=template_content,
+            question_text=question_text,
+            model=model_override,
+            source_agent_name=agent_name,
+            source_template_name=template_name,
+            source_template_id=template_id,
+        )
+    except Exception as exc:  # noqa: BLE001 — 单 task 失败隔离
+        logger.exception("scheme run task %s generation failed", task_id)
+        db = session_factory()
+        try:
+            _fail_task(db, task_id, str(exc))
+        finally:
+            db.close()
+        return None
+
+    db = session_factory()
+    try:
+        task = db.get(GenerationSchemeRunTask, task_id)
+        task.status = "done"
+        task.article_id = article_id
+        task.completed_at = utcnow()
+        db.commit()
+    finally:
+        db.close()
+
+    # 生文成功后自动 AI 排版 + 全 bucket 智能配图（尽力而为，不影响任务结果）
+    _auto_format_article(article_id, user_id, session_factory)
+    # [临时] 封面兜底：从 GEO_TEMP_COVER_BUCKET 随机取图当封面（后期删除本行 + _assign_temp_cover_from_bucket）
+    _assign_temp_cover_from_bucket(article_id, user_id, session_factory)
+    return article_id
+
+
+def run_scheme(run_id: int, session_factory: SessionFactory) -> None:
+    """方案运行入口（由后台线程调用）：等到并发槽后执行运行。
+
+    用 acquire(timeout)：多于 cap 的运行在此等待（不持 DB 连接），等槽超时即把 run 置 failed、
+    不无限阻塞（#9）；避免「连点运行 = 无界线程 ×4 worker 争抢连接池」。槽在 finally 释放，
+    与 pipeline run_pipeline 对称。
+    """
+    if not _RUN_GATE.acquire(timeout=_run_acquire_timeout()):
+        logger.warning("scheme run %s timed out waiting for a concurrency slot", run_id)
+        _mark_run_failed(run_id, session_factory, "等待并发槽位超时，运行已中止")
+        return
+    try:
+        _run_scheme_inner(run_id, session_factory)
+    finally:
+        _RUN_GATE.release()
+
+
+def submit_scheme_run(run_id: int, session_factory: SessionFactory) -> None:
+    """把方案运行派发到有界线程池执行（替代路由里的裸 threading.Thread，封堵 #5 无界 spawn）。
+
+    池满时提交安静排队（不起新线程、不持 DB 连接）。run_scheme 内部自带 _RUN_GATE 等槽超时兜底。
+    """
+
+    def _run() -> None:
+        try:
+            run_scheme(run_id, session_factory)
+        except Exception:
+            logger.exception("scheme run background thread failed for run %d", run_id)
+
+    _DISPATCH_POOL.submit(_run)
+
+
+def _mark_run_failed(run_id: int, session_factory: SessionFactory, message: str) -> None:
+    """开短 session 把 pending/running 的方案 run 置 failed（等槽超时用）。"""
+    db = session_factory()
+    try:
+        run = db.get(GenerationSchemeRun, run_id)
+        if run is not None and run.status in ("pending", "running"):
+            run.status = "failed"
+            run.error_message = message
+            run.completed_at = utcnow()
+            db.commit()
+    finally:
+        db.close()
+
+
+def _run_scheme_inner(run_id: int, session_factory: SessionFactory) -> None:
+    """方案运行执行体：并发执行所有任务，汇总运行状态。"""
+    db = session_factory()
+    try:
+        run = db.get(GenerationSchemeRun, run_id)
+        if run is None:
+            logger.error("run_scheme: run %s not found", run_id)
+            return
+        run.status = "running"
+        user_id = run.user_id
+        model_override = run.ai_engine
+        scheme = db.get(GenerationScheme, run.scheme_id)
+        scheme_name = scheme.name if scheme is not None else None
+        task_ids = [
+            t.id
+            for t in db.query(GenerationSchemeRunTask)
+            .filter(GenerationSchemeRunTask.run_id == run_id)
+            .order_by(GenerationSchemeRunTask.id.asc())
+            .all()
+        ]
+        db.commit()
+    finally:
+        db.close()
+
+    if task_ids:
+        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="scheme-run") as executor:
+            futures = {
+                executor.submit(
+                    _execute_task, tid, user_id, session_factory, model_override, scheme_name
+                ): tid
+                for tid in task_ids
+            }
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception:
+                    logger.exception("scheme run task %s crashed", futures[future])
+
+    _aggregate_run(run_id, session_factory)
+    _group_run_articles(run_id, session_factory)
+
+
+def recover_stuck_scheme_runs(db: Any) -> None:
+    """启动时复位崩溃残留的方案运行（running/pending → failed）。
+
+    与 pipeline run 对称：进程刚启动时没有 run 真正在执行，所有 running/pending 都是
+    上次崩溃的残留，直接置 failed（方案运行没有租约机制，故全量复位、不按阈值）。
+    """
+    from sqlalchemy import select
+
+    runs = list(
+        db.execute(
+            select(GenerationSchemeRun).where(GenerationSchemeRun.status.in_(ACTIVE_RUN_STATUSES))
+        )
+        .scalars()
+        .all()
+    )
+    for run in runs:
+        run.status = "failed"
+        run.error_message = "进程重启：运行在上次执行中意外中断"
+        run.completed_at = utcnow()
+    if runs:
+        logger.warning("Recovered %d stuck scheme runs: %s", len(runs), [r.id for r in runs])
+        db.commit()
+
+
+def _aggregate_run(run_id: int, session_factory: SessionFactory) -> None:
+    db = session_factory()
+    try:
+        run = db.get(GenerationSchemeRun, run_id)
+        if run is None:
+            return
+        tasks = (
+            db.query(GenerationSchemeRunTask).filter(GenerationSchemeRunTask.run_id == run_id).all()
+        )
+        done = [t for t in tasks if t.status == "done"]
+        failed = [t for t in tasks if t.status == "failed"]
+        run.article_ids = [t.article_id for t in done if t.article_id is not None]
+        if not done:
+            run.status = "failed"
+        elif failed:
+            run.status = "partial_failed"
+        else:
+            run.status = "done"
+        if failed:
+            run.error_message = "; ".join(
+                f"task#{t.id}: {t.error_message or '失败'}" for t in failed
+            )[:2000]
+        run.completed_at = utcnow()
+        db.commit()
+    finally:
+        db.close()
+
+
+def _group_run_articles(run_id: int, session_factory: SessionFactory) -> None:
+    """方案运行产出文章：标 pending + 归入新方案组。复用 articles.mark_pending_and_group。"""
+    from server.app.modules.articles.service import mark_pending_and_group
+
+    db = session_factory()
+    try:
+        run = db.get(GenerationSchemeRun, run_id)
+        if run is None:
+            return
+        article_ids = list(run.article_ids or [])
+        if not article_ids:
+            return
+        scheme = db.get(GenerationScheme, run.scheme_id)
+        scheme_name = scheme.name if scheme is not None else f"方案 {run.scheme_id}"
+        base_name = f"{run.created_at:%Y/%m/%d %H:%M} · {scheme_name}"
+        uid = run.user_id
+        rid = run.id
+    finally:
+        db.close()
+
+    gid = mark_pending_and_group(
+        session_factory,
+        article_ids=article_ids,
+        user_id=uid,
+        base_name=base_name,
+        fallback_suffix=f"#{rid}",
+    )
+    if gid is None:
+        # 成组/送审失败：与 pipeline 执行器对齐，降级运行状态 + 写明原因，
+        # 避免 UI 显示成功而文章其实未送审/未成组。
+        db = session_factory()
+        try:
+            run = db.get(GenerationSchemeRun, run_id)
+            if run is not None:
+                if run.status == "done":
+                    run.status = "partial_failed"
+                note = "文章已生成但送审/成组失败，请手动核对审核状态"
+                run.error_message = f"{run.error_message}; {note}" if run.error_message else note
+                db.commit()
+        finally:
+            db.close()
+
+
+def _auto_format_article(
+    article_id: int,
+    user_id: int,
+    session_factory: SessionFactory,
+) -> None:
+    """方案生文成功后自动 AI 排版 + 用全部图片 bucket 智能配图。
+
+    尽力而为：任何失败只记日志，绝不影响已生成的文章 / 任务状态。
+    """
+    try:
+        from server.app.modules.articles.ai_format import has_ai_format_targets
+        from server.app.modules.articles.models import Article
+        from server.app.modules.system.models import User
+
+        lock_started_at = utcnow().replace(microsecond=0)
+        preset_id: int | None = None
+        candidate_categories: list[Any] = []
+        game_positions: list[dict] | None = None
+
+        db = session_factory()
+        try:
+            article = db.get(Article, article_id)
+            if article is None or article.is_deleted:
+                return
+            if not has_ai_format_targets(article.content_json):
+                return
+            # 写作模型盖的显式游戏清单（盘点 / 推荐文）→ 走确定性落图；无则回退弱模型识别
+            game_positions = (article.metrics or {}).get("game_positions")
+            user = db.get(User, user_id)
+            preset_id = getattr(user, "ai_format_preset_id", None) if user else None
+            candidate_categories = all_category_contexts(db)
+            article.ai_checking = True
+            article.ai_checking_started_at = lock_started_at
+            article.ai_format_error = None
+            db.commit()
+        finally:
+            db.close()
+
+        if game_positions:
+            run_ai_format_from_game_list(
+                article_id,
+                lock_started_at=lock_started_at,
+                game_list=game_positions,
+                preset_id=preset_id,
+                user_id=user_id,
+                candidate_categories=candidate_categories,
+                max_images=12,  # 积极配图：盘点文每款一图（确定性路 min_spacing 不生效）
+                min_spacing=1,
+                builtin_variant="aggressive",
+            )
+        else:
+            run_ai_format(
+                article_id,
+                include_images=True,
+                lock_started_at=lock_started_at,
+                preset_id=preset_id,
+                user_id=user_id,
+                candidate_categories=candidate_categories,
+            )
+    except Exception:  # noqa: BLE001 — 自动排版失败不影响生文结果
+        logger.exception("auto ai_format failed for article %s", article_id)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [临时] 封面兜底
+#
+# 封面图目前没有自动生成逻辑。在接入真正的封面方案之前，先从 GEO_TEMP_COVER_BUCKET
+# 指定的 bucket 随机取一张图当封面（默认 cantingyangchengji；置空则整段禁用）。
+# 后期删除整段（配置 temp_cover_bucket + 函数 + _execute_task 里的调用）即可。
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _assign_temp_cover_from_bucket(
+    article_id: int,
+    user_id: int,
+    session_factory: SessionFactory,
+) -> None:
+    """[临时] 从 GEO_TEMP_COVER_BUCKET 指定 bucket 随机取一张图，落成 Asset 后设为封面。
+
+    - 未配置 GEO_TEMP_COVER_BUCKET（空字符串）时整段跳过，连会话都不开。
+    - 走 store_bytes 落成真实 Asset（cover_asset_id 外键有效，发布驱动可上传文件）。
+    - 已有封面的文章跳过，不覆盖。
+    - 尽力而为：任何失败只记日志，绝不影响已生成的文章 / 任务状态。
+    """
+    bucket = get_settings().temp_cover_bucket
+    if not bucket:
+        return  # 未配置临时封面 bucket：整段禁用
+    try:
+        import mimetypes
+
+        from server.app.modules.articles.models import Article
+        from server.app.modules.articles.store import store_bytes
+        from server.app.modules.image_library.models import StockCategory, StockImage
+        from server.app.modules.image_library.store import get_object_bytes
+
+        db = session_factory()
+        try:
+            article = db.get(Article, article_id)
+            if article is None or article.is_deleted or article.cover_asset_id:
+                return
+
+            category = db.query(StockCategory).filter(StockCategory.bucket_name == bucket).first()
+            if category is None:
+                logger.info("temp cover: bucket %s 未注册，跳过", bucket)
+                return
+
+            # 预采样随机：先取数量再随机 offset，避免 ORDER BY RAND() 全表排序
+            count = db.query(StockImage).filter(StockImage.category_id == category.id).count()
+            if count == 0:
+                logger.info("temp cover: bucket %s 无图片，跳过", bucket)
+                return
+            image = (
+                db.query(StockImage)
+                .filter(StockImage.category_id == category.id)
+                .order_by(StockImage.id.asc())
+                .offset(random.randint(0, count - 1))
+                .first()
+            )
+            if image is None:
+                return
+
+            data = get_object_bytes(category.bucket_name, image.minio_key)
+            content_type = mimetypes.guess_type(image.filename)[0] or "image/jpeg"
+            stored = store_bytes(db, user_id, data, image.filename, content_type)
+
+            article.cover_asset_id = stored.asset.id
+            article.version += 1
+            article.updated_at = utcnow()
+            db.commit()
+            logger.info("temp cover 设置成功 article=%s image=%s", article_id, image.minio_key)
+        finally:
+            db.close()
+    except Exception:  # noqa: BLE001 — 临时封面失败不影响生文结果
+        logger.exception("temp cover assignment failed for article %s", article_id)

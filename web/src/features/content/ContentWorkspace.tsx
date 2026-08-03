@@ -1,0 +1,1477 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useBlocker } from "react-router-dom";
+import { EditorContent, useEditor } from "@tiptap/react";
+import { Plus, Save, Search, Trash2, Upload, ChevronRight, Check, Send, ShieldCheck, ListChecks, RefreshCw } from "lucide-react";
+import { useToast } from "../../components/Toast";
+import {
+  approveArticle,
+  approveGroup,
+  createArticle,
+  createArticleGroup,
+  deleteArticle,
+  deleteArticleGroup,
+  getArticle,
+  listArticleFeed,
+  listArticleGroups,
+  revokeArticleApproval,
+  updateArticle,
+  updateArticleCover,
+  updateArticleGroup,
+  updateArticleGroupItems,
+} from "../../api/articles";
+import { listAccounts } from "../../api/accounts";
+import { uploadAsset as uploadAssetRequest } from "../../api/assets";
+import { assetSrc, assetThumbSrc, countWords, emptyDoc, newClientRequestId, singleFlight, withAssetToken } from "../../api/core";
+import type { Account, Article, ArticleCreatePayload, ArticleFeedItem, ArticleGroup, ArticleGroupUpdateItemsPayload, ArticleGroupWithMembers, ArticleSummary, ArticleUpdatePayload, Draft, ReviewStatus } from "../../types";
+import { formatDateTime } from "../../utils/dateFormat";
+import { EditorToolbar } from "../../components/editor/EditorToolbar";
+import { ImageSaveDialog } from "../../components/editor/ImageSaveDialog";
+import { ArticleListItem, ReviewBadge, formatArticleTemplateSource } from "../../components/ArticleListItem";
+import { Modal } from "../../components/Modal";
+import { Pagination } from "../../components/Pagination";
+import { DistributeModal, type DistributeTarget } from "./DistributeModal";
+import { buildReadonlyExtensions } from "./readonlyExtensions";
+import { XhsNotePreview } from "./XhsNotePreview";
+
+function makeEmptyDraft(): Draft {
+  return {
+    id: null,
+    title: "",
+    author: "",
+    cover_asset_id: null,
+    status: "draft",
+    version: null,
+    stock_category_ids: [],
+  };
+}
+
+type EditorDoc = Record<string, unknown>;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function extractLocalAssetId(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const marker = "/api/assets/";
+  const markerIndex = value.indexOf(marker);
+  if (markerIndex < 0) return null;
+  const tail = value.slice(markerIndex + marker.length);
+  const assetId = tail.split(/[?#/]/)[0];
+  return assetId || null;
+}
+
+function extractStockImageId(value: unknown): number | null {
+  if (typeof value !== "string") return null;
+  const match = value.match(/\/api\/stock-images\/(\d+)\/file/);
+  return match ? Number(match[1]) : null;
+}
+
+function normalizeEditorDocument(value: unknown, mode: "display" | "save"): EditorDoc {
+  const normalized = normalizeEditorNode(value, mode);
+  const doc = isRecord(normalized) ? normalized : { ...emptyDoc };
+  return isEmptyEditorDocument(doc) ? { ...emptyDoc } : doc;
+}
+
+function normalizeEditorNode(value: unknown, mode: "display" | "save"): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeEditorNode(item, mode));
+  }
+  if (!isRecord(value)) {
+    return value;
+  }
+
+  const next: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (key === "content") {
+      next.content = Array.isArray(child) ? child.map((item) => normalizeEditorNode(item, mode)) : child;
+    } else if (key === "attrs") {
+      const attrs = cleanEditorAttrs(child);
+      if (Object.keys(attrs).length > 0) next.attrs = attrs;
+    } else {
+      next[key] = child;
+    }
+  }
+
+  if (next.type === "image") {
+    const attrs = isRecord(next.attrs) ? { ...next.attrs } : {};
+    const assetId =
+      (typeof attrs.assetId === "string" && attrs.assetId) ||
+      (typeof attrs.asset_id === "string" && attrs.asset_id) ||
+      (typeof attrs.dataAssetId === "string" && attrs.dataAssetId) ||
+      extractLocalAssetId(attrs.src);
+    if (assetId) {
+      attrs.assetId = assetId;
+      attrs.src = mode === "display" ? assetSrc(assetId) ?? `/api/assets/${assetId}` : `/api/assets/${assetId}`;
+      next.attrs = attrs;
+    } else {
+      const stockImageId =
+        (typeof attrs.stockImageId === "number" && attrs.stockImageId) ||
+        (typeof attrs.stockImageId === "string" && Number(attrs.stockImageId)) ||
+        (typeof attrs.stock_image_id === "number" && attrs.stock_image_id) ||
+        (typeof attrs.stock_image_id === "string" && Number(attrs.stock_image_id)) ||
+        extractStockImageId(attrs.src);
+      if (stockImageId) {
+        attrs.stockImageId = stockImageId;
+        attrs.src = `/api/stock-images/${stockImageId}/file`;
+        next.attrs = attrs;
+      }
+    }
+  }
+
+  return next;
+}
+
+function cleanEditorAttrs(value: unknown): Record<string, unknown> {
+  if (!isRecord(value)) return {};
+  return Object.entries(value).reduce<Record<string, unknown>>((acc, [key, child]) => {
+    if (child !== null && child !== undefined && child !== "") acc[key] = child;
+    return acc;
+  }, {});
+}
+
+function isEmptyEditorDocument(value: EditorDoc): boolean {
+  if (value.type !== "doc") return false;
+  const content = value.content;
+  if (!Array.isArray(content) || content.length === 0) return true;
+  return content.every((node) => {
+    if (!isRecord(node) || node.type !== "paragraph") return false;
+    const paragraphContent = node.content;
+    const attrs = isRecord(node.attrs) ? node.attrs : {};
+    return (!Array.isArray(paragraphContent) || paragraphContent.length === 0) && Object.keys(attrs).length === 0;
+  });
+}
+
+function editorBodyState(editor: { getJSON: () => unknown }): string {
+  return stableStringify(normalizeEditorDocument(editor.getJSON(), "save"));
+}
+
+function cleanLocalAssetUrlsInHtml(html: string): string {
+  return html.replace(/(src=["'])\/api\/assets\/([^"'?/]+)(?:\?[^"']*)?(["'])/g, "$1/api/assets/$2$3");
+}
+
+function stableStringify(value: unknown): string {
+  return JSON.stringify(sortJsonValue(value));
+}
+
+function sortJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(sortJsonValue);
+  }
+  if (!isRecord(value)) {
+    return value;
+  }
+  return Object.keys(value).sort().reduce<Record<string, unknown>>((acc, key) => {
+    acc[key] = sortJsonValue(value[key]);
+    return acc;
+  }, {});
+}
+
+const EMPTY_BODY_STATE = stableStringify(normalizeEditorDocument(emptyDoc, "save"));
+
+// CustomTextStyle / ImageResizeView / CustomImage 已抽到 ./readonlyExtensions（与只读 reader 复用同一套
+// Tiptap 扩展定义）；编辑器扩展改由 buildReadonlyExtensions() 构建。
+
+const LIST_PAGE_SIZE = 10;
+
+type UnifiedListItem =
+  | { type: "article"; article: ArticleSummary }
+  | { type: "group"; group: ArticleGroupWithMembers };
+
+interface Props {
+  isActive?: boolean;
+  reviewTab?: ReviewStatus;
+  onReviewTabChange?: (t: ReviewStatus) => void;
+  isMobile?: boolean;
+  deepLinkArticleId?: number;
+}
+
+export function ContentWorkspace({
+  isActive,
+  reviewTab: reviewTabProp,
+  onReviewTabChange,
+  isMobile,
+  deepLinkArticleId,
+}: Props = {}) {
+  const { toast } = useToast();
+  // 主列表数据源：服务端合并分页 feed（散篇文章 + 分组混排的一页）+ 两 tab 计数。
+  const [feedItems, setFeedItems] = useState<ArticleFeedItem[]>([]);
+  const [feedCounts, setFeedCounts] = useState<{ pending: number; approved: number }>({
+    pending: 0,
+    approved: 0,
+  });
+  // groups 仅供「加入分组」选择器与分组编辑用（需全量分组列表），不再喂主列表。
+  const [groups, setGroups] = useState<ArticleGroup[]>([]);
+  const [selectedArticle, setSelectedArticle] = useState<Article | null>(null);
+  const [selectedArticleIds, setSelectedArticleIds] = useState<number[]>([]);
+  const [query, setQuery] = useState("");
+  const [articlePage, setArticlePage] = useState(0);
+  const [draft, setDraft] = useState<Draft>(makeEmptyDraft);
+  const [loading, setLoading] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [statusText, setStatusText] = useState("");
+  const [pendingCoverUrl, setPendingCoverUrl] = useState<string | null>(null);
+  const [groupName, setGroupName] = useState("");
+  const [editingGroupId, setEditingGroupId] = useState<number | null>(null);
+  const [expandedGroupIds, setExpandedGroupIds] = useState<Set<number>>(new Set());
+  const [groupPickerArticle, setGroupPickerArticle] = useState<ArticleSummary | null>(null);
+  const [saveImageSrc, setSaveImageSrc] = useState<string | null>(null);
+  const [groupPickerSelectedId, setGroupPickerSelectedId] = useState<number | null>(null);
+  const [confirmDeleteArticle, setConfirmDeleteArticle] = useState(false);
+  const [confirmDeleteGroup, setConfirmDeleteGroup] = useState(false);
+  const [confirmUnsavedNew, setConfirmUnsavedNew] = useState(false);
+  const [reviewTab, setReviewTab] = useState<ReviewStatus>(reviewTabProp ?? "pending");
+  const [reviewBusyId, setReviewBusyId] = useState<number | null>(null);
+
+  // reviewTab 由 URL 段 /content/:status 驱动。tab 切换（点击或浏览器前进/后退）都经 reviewTabProp 变化，
+  // 由本 effect 统一 setReviewTab + 重取该 tab 第 0 页——单一入口，避免与 selectReviewTab 双取。
+  // 首次挂载时 reviewTab 已用 prop 初始化，prop===当前 tab 故跳过（初始拉取交给 mount 的 manualRefresh）。
+  useEffect(() => {
+    if (!reviewTabProp || reviewTabProp === reviewTab) return;
+    setReviewTab(reviewTabProp);
+    setSelectedArticleIds([]);
+    void refreshArticles(query, 0, reviewTabProp);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reviewTabProp]);
+  const [accounts, setAccounts] = useState<Account[]>([]);
+  const [distributeTarget, setDistributeTarget] = useState<DistributeTarget | null>(null);
+
+  const pasteImageRef = useRef<(file: File) => void>(() => {});
+  const isInitialMountRef = useRef(true);
+  const refreshingRef = useRef(false);
+  const lastAutoRefreshRef = useRef(0);
+  const manualRefreshRef = useRef<() => void>(() => {});
+  const [charCount, setCharCount] = useState(0);
+  const [imageUploading, setImageUploading] = useState(0);
+  const pendingBlobsRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    const blobs = pendingBlobsRef.current;
+    return () => { blobs.forEach(URL.revokeObjectURL); };
+  }, []);
+
+  const editor = useEditor({
+    // 扩展集合抽到共享工厂（与高质量库只读 reader 复用同一套定义）；每次返回全新实例，
+    // 不跨 editor 共享扩展对象。Tiptap v3 注意事项（StarterKit 已内置 link/underline，禁止重复注册）
+    // 详见 buildReadonlyExtensions 的注释。
+    extensions: buildReadonlyExtensions(),
+    content: emptyDoc,
+    onUpdate({ editor }) {
+      setCharCount(editor.getText().replace(/\s/g, "").length);
+    },
+    editorProps: {
+      attributes: {
+        class: "editorSurface",
+      },
+      transformPastedHTML(html) {
+        return html.replace(/ style="[^"]*"/gi, "");
+      },
+      handlePaste(view, event) {
+        if (!view.editable) return false;
+        const items = Array.from(event.clipboardData?.items ?? []);
+        const imageItem = items.find((item) => item.type.startsWith("image/"));
+        if (!imageItem) return false;
+        const file = imageItem.getAsFile();
+        if (!file) return false;
+        pasteImageRef.current(file);
+        return true;
+      },
+    },
+  });
+
+  const latestDraft = useRef(draft);
+  latestDraft.current = draft;
+  const latestEditor = useRef(editor);
+  latestEditor.current = editor;
+  const savedStateRef = useRef<{ title: string; author: string; cover_asset_id: number | string | null; bodyState: string } | null>(null);
+  // 只读判定：无选中(新建草稿)/属主/admin 皆可编辑；仅他人分享时 can_edit===false → 只读
+  const canEdit = selectedArticle?.can_edit !== false;
+
+  // 当前编辑器是否有未保存改动（读 ref，恒取最新值；空依赖即稳定）。
+  // xhs 图文预览（独立编辑器）的未保存态：由 XhsNotePreview 上报到此 ref，并入 isDirty。
+  const xhsDirtyRef = useRef(false);
+  const handleXhsDirty = useCallback((dirtyState: boolean) => {
+    xhsDirtyRef.current = dirtyState;
+  }, []);
+
+  const isDirty = useCallback(() => {
+    if (xhsDirtyRef.current) return true; // xhs 图文预览的未保存文案
+    const d = latestDraft.current;
+    const e = latestEditor.current;
+    const s = savedStateRef.current;
+    const currentBodyState = e ? editorBodyState(e) : EMPTY_BODY_STATE;
+    if (!s) {
+      return d.title.trim() !== "" || d.author.trim() !== "" || d.cover_asset_id !== null || currentBodyState !== EMPTY_BODY_STATE;
+    }
+    return (
+      d.title.trim() !== s.title ||
+      d.author.trim() !== s.author ||
+      d.cover_asset_id !== s.cover_asset_id ||
+      currentBodyState !== s.bodyState
+    );
+  }, []);
+
+  // 路由切换拦截：离开「内容管理」且有未保存改动时确认（覆盖侧栏点击、移动端导航、浏览器前进/后退）。
+  const inWorkspace = (p: string) => p.startsWith("/content") || p.startsWith("/article");
+  const blocker = useBlocker(
+    ({ nextLocation }) => isDirty() && !inWorkspace(nextLocation.pathname),
+  );
+  const promptingRef = useRef(false);
+  useEffect(() => {
+    if (blocker.state !== "blocked") {
+      promptingRef.current = false;
+      return;
+    }
+    if (promptingRef.current) return; // 防 StrictMode 下重复弹窗
+    promptingRef.current = true;
+    if (window.confirm("当前文章有未保存内容，确定要切换页面吗？未保存的修改将丢失。")) {
+      blocker.proceed();
+    } else {
+      blocker.reset();
+    }
+  }, [blocker]);
+
+  // 整页刷新 / 关闭标签页时浏览器原生拦截。
+  useEffect(() => {
+    const handler = (e: BeforeUnloadEvent) => {
+      if (isDirty()) {
+        e.preventDefault();
+        e.returnValue = "";
+      }
+    };
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  }, [isDirty]);
+
+  // 深链进入 /article/:id：等 editor 就绪后按 id 载入；仅在 id 变化时触发（换 id 经未保存守卫）。
+  // useEditor 首帧返回 null，未就绪时调 loadArticleById 会被 editor?. 静默跳过、停在空白，故必须 gate 在 editor。
+  const lastDeepLinkRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!editor || !deepLinkArticleId) return;
+    if (lastDeepLinkRef.current === deepLinkArticleId) return;
+    lastDeepLinkRef.current = deepLinkArticleId;
+    void loadArticleGuarded(() => loadArticleById(deepLinkArticleId));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editor, deepLinkArticleId]);
+
+  // 只读降级基线：非作者打开分享文章时禁用编辑器 DOM 输入(programmatic 写入另由下方逐项屏蔽)。
+  useEffect(() => {
+    editor?.setEditable(canEdit);
+  }, [editor, canEdit]);
+
+  // articleById：本页出现过的文章（散篇 + 分组内嵌组员），供分组展开 / 分发 / 勾选反查。
+  const articleById = useMemo(() => {
+    const map: Record<number, ArticleSummary> = {};
+    for (const it of feedItems) {
+      if (it.kind === "article" && it.article) map[it.article.id] = it.article;
+      if (it.kind === "group" && it.group) for (const m of it.group.members) map[m.id] = m;
+    }
+    return map;
+  }, [feedItems]);
+
+  function groupReviewCounts(group: ArticleGroup): { total: number; approved: number } {
+    if (group.review_summary) return group.review_summary;
+    // Fallback: derive from loaded member articles when the backend omits the summary.
+    let total = 0;
+    let approved = 0;
+    for (const item of group.items) {
+      const article = articleById[item.article_id];
+      if (!article) continue;
+      total += 1;
+      if (article.review_status === "approved") approved += 1;
+    }
+    return { total, approved };
+  }
+
+  // 主列表直接用服务端返回的混排项（已按 created_at 倒序合并 + 切好当前页），前端不再合并/排序/切片。
+  const unifiedList: UnifiedListItem[] = useMemo(
+    () =>
+      feedItems.map((it) =>
+        it.kind === "article"
+          ? { type: "article" as const, article: it.article as ArticleSummary }
+          : { type: "group" as const, group: it.group as ArticleGroupWithMembers },
+      ),
+    [feedItems],
+  );
+
+  const pagedUnifiedList = unifiedList; // 服务端已切页
+  const reviewCounts = feedCounts; // 角标用服务端计数
+  const totalArticlePages = Math.max(1, Math.ceil(feedCounts[reviewTab] / LIST_PAGE_SIZE));
+
+  // 一页一查：入参 (query, page, tab)。翻页 / 切 tab / 改搜索都触发重取。
+  async function refreshArticles(
+    nextQuery = query,
+    nextPage = articlePage,
+    nextTab: ReviewStatus = reviewTab,
+  ) {
+    try {
+      const resp = await listArticleFeed({
+        review_status: nextTab,
+        q: nextQuery || undefined,
+        skip: nextPage * LIST_PAGE_SIZE,
+        limit: LIST_PAGE_SIZE,
+      });
+      // 删到当前页空且非首页：按 counts 夹紧页码回退再取，避免卡在空页。
+      if (resp.items.length === 0 && nextPage > 0) {
+        const lastPage = Math.max(0, Math.ceil(resp.counts[nextTab] / LIST_PAGE_SIZE) - 1);
+        if (lastPage < nextPage) {
+          await refreshArticles(nextQuery, lastPage, nextTab);
+          return;
+        }
+      }
+      setFeedItems(resp.items);
+      setFeedCounts(resp.counts);
+      setArticlePage(nextPage);
+    } catch {
+      toast("加载文章列表失败", "error");
+    }
+  }
+
+  async function refreshGroups() {
+    try {
+      const data = await listArticleGroups();
+      setGroups(data);
+    } catch {
+      toast("加载分组列表失败", "error");
+    }
+  }
+
+  // 列表 + 分组一起重拉，并驱动「刷新中」指示。refreshingRef 防重入（聚焦事件可能连发、或与手动
+  // 点击撞车）。闭包读当前 query / articlePage，故 refreshArticles() 用默认参即保留当前搜索与页码。
+  async function manualRefresh() {
+    if (refreshingRef.current) return;
+    refreshingRef.current = true;
+    setRefreshing(true);
+    try {
+      await Promise.all([refreshArticles(), refreshGroups()]);
+    } finally {
+      refreshingRef.current = false;
+      setRefreshing(false);
+    }
+  }
+  manualRefreshRef.current = manualRefresh;
+
+  useEffect(() => {
+    void manualRefresh();
+    listAccounts().then(setAccounts).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (isInitialMountRef.current) {
+      isInitialMountRef.current = false;
+      return;
+    }
+    if (!isActive) return;
+    void manualRefresh();
+  }, [isActive]);
+
+  // 窗口 / 标签重新获得焦点时自动拉最新——覆盖「停在内容管理页、后台又生成了新文章」的场景
+  // （子 tab 切换与审核操作都不触发重拉）。经 manualRefreshRef 调最新闭包，故只订阅一次；
+  // 轻 throttle 5s 防 alt-tab 频繁触发；只更新列表数据、不动编辑器 / 草稿，编辑中也安全。
+  useEffect(() => {
+    function onFocus() {
+      if (document.visibilityState !== "visible") return;
+      const now = Date.now();
+      if (now - lastAutoRefreshRef.current < 5000) return;
+      lastAutoRefreshRef.current = now;
+      manualRefreshRef.current();
+    }
+    document.addEventListener("visibilitychange", onFocus);
+    window.addEventListener("focus", onFocus);
+    return () => {
+      document.removeEventListener("visibilitychange", onFocus);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, []);
+
+  function resetDraft() {
+    setDraft(makeEmptyDraft());
+    setSelectedArticle(null);
+    setPendingCoverUrl((url) => { if (url) URL.revokeObjectURL(url); return null; });
+    editor?.commands.setContent(emptyDoc);
+    setSelectedArticleIds([]);
+    savedStateRef.current = null;
+  }
+
+  // 把已拉取的文章详情灌入编辑器：setSelectedArticle → setDraft → setContent → 算 bodyState → 写 savedStateRef。
+  // loadArticle（列表点选）与 loadArticleById（深链）共用，集中保证「先 setContent 再算 bodyState 再写 ref」的顺序，
+  // 避免两处各自照抄、日后单边改漏导致离开时误弹「未保存」。
+  function applyLoadedArticleDetail(detail: Article) {
+    setSelectedArticle(detail);
+    setDraft({
+      id: detail.id,
+      title: detail.title,
+      author: detail.author ?? "",
+      cover_asset_id: detail.cover_asset_id,
+      status: detail.status,
+      version: detail.version,
+      stock_category_ids: detail.stock_category_ids ?? [],
+    });
+    const displayDoc = normalizeEditorDocument(detail.content_json || emptyDoc, "display");
+    // 用最新 editor 实例（latestEditor.current）而非闭包 editor：深链走 await getArticle 期间，
+    // editor 可能被销毁重建（React StrictMode 的 mount→unmount→remount，或任何触发 useEditor 重建的
+    // re-render）。闭包捕获的旧实例此时已 isDestroyed，setContent 灌给它不会渲染到 DOM → 正文空白。
+    const ed = latestEditor.current;
+    ed?.commands.setContent(displayDoc);
+    const bodyState = ed
+      ? editorBodyState(ed)
+      : stableStringify(normalizeEditorDocument(detail.content_json || emptyDoc, "save"));
+    savedStateRef.current = {
+      title: detail.title?.trim() ?? "",
+      author: detail.author?.trim() ?? "",
+      cover_asset_id: detail.cover_asset_id,
+      bodyState,
+    };
+  }
+
+  async function loadArticle(article: ArticleSummary) {
+    setPendingCoverUrl((url) => { if (url) URL.revokeObjectURL(url); return null; });
+    // Pre-populate title/metadata immediately from the list summary (no API wait)
+    setDraft({
+      id: article.id,
+      title: article.title,
+      author: article.author ?? "",
+      cover_asset_id: article.cover_asset_id,
+      status: article.status,
+      version: article.version,
+      stock_category_ids: [],
+    });
+    setLoading(true);
+    setStatusText("加载中");
+    try {
+      const detail = await getArticle(article.id);
+      applyLoadedArticleDetail(detail);
+    } catch (error) {
+      toast(error instanceof Error ? error.message : "加载文章失败", "error");
+    } finally {
+      setLoading(false);
+      setStatusText("");
+    }
+  }
+
+  // 统一「载入另一篇文章」入口：当前有未保存改动先确认，取消则不载入。
+  // 列表点选与深链换 id 都经此守卫（顺带修好现有列表点选直接冲掉未保存内容的老 gap）。
+  async function loadArticleGuarded(loader: () => Promise<void>) {
+    if (isDirty() && !window.confirm("当前文章有未保存内容，确定切换吗？未保存的修改将丢失。")) {
+      return;
+    }
+    await loader();
+  }
+
+  // 按 id 直接载入（深链用）：不依赖列表 summary 预填，直接拉详情经 applyLoadedArticleDetail 灌入编辑器。
+  async function loadArticleById(id: number) {
+    setPendingCoverUrl((url) => { if (url) URL.revokeObjectURL(url); return null; });
+    setLoading(true);
+    setStatusText("加载中");
+    try {
+      const detail = await getArticle(id);
+      applyLoadedArticleDetail(detail);
+    } catch (error) {
+      toast(error instanceof Error ? error.message : "加载文章失败", "error");
+    } finally {
+      setLoading(false);
+      setStatusText("");
+    }
+  }
+
+  async function copyArticleLink(id: number) {
+    const url = `${window.location.origin}/article/${id}`;
+    try {
+      await navigator.clipboard.writeText(url);
+      toast("链接已复制", "success");
+    } catch {
+      toast(`复制失败，链接：${url}`, "info"); // 无剪贴板权限时把链接显示出来供手动复制
+    }
+  }
+
+  function applySavedArticle(saved: Article, contentJson?: Record<string, unknown>) {
+    setSelectedArticle(saved);
+    setDraft({
+      id: saved.id,
+      title: saved.title,
+      author: saved.author?.trim() ?? "",
+      cover_asset_id: saved.cover_asset_id,
+      status: saved.status,
+      version: saved.version,
+      stock_category_ids: saved.stock_category_ids ?? [],
+    });
+    savedStateRef.current = {
+      title: saved.title?.trim() ?? "",
+      author: saved.author ?? "",
+      cover_asset_id: saved.cover_asset_id,
+      bodyState: contentJson
+        ? stableStringify(contentJson)
+        : stableStringify(normalizeEditorDocument(saved.content_json || emptyDoc, "save")),
+    };
+  }
+
+  async function persistArticle({ quiet = false }: { quiet?: boolean } = {}): Promise<Article | null> {
+    if (!editor || !draft.title.trim()) {
+      if (!quiet) toast("标题不能为空", "error");
+      return null;
+    }
+    if (imageUploading > 0) {
+      if (!quiet) toast("请等待图片上传完成再保存", "error");
+      return null;
+    }
+    setLoading(true);
+    setStatusText("保存中");
+    try {
+      const contentJson = normalizeEditorDocument(editor.getJSON(), "save");
+      const base = {
+        title: draft.title.trim(),
+        author: draft.author.trim() || null,
+        cover_asset_id: draft.cover_asset_id,
+        content_json: contentJson,
+        content_html: cleanLocalAssetUrlsInHtml(editor.getHTML()),
+        plain_text: editor.getText(),
+        word_count: countWords(editor.getText()),
+        status: draft.status,
+        version: draft.version,
+        stock_category_ids: draft.stock_category_ids,
+      };
+      const articleId = draft.id;
+      const saved = articleId
+        ? await singleFlight(`article-save-${articleId}`, () => {
+            const payload: ArticleUpdatePayload = { ...base };
+            return updateArticle(articleId, payload);
+          })
+        : await singleFlight("article-create", () => {
+            const payload: ArticleCreatePayload = { ...base, client_request_id: newClientRequestId("article") };
+            return createArticle(payload);
+          });
+      if (!saved) return null;
+      applySavedArticle(saved, contentJson);
+      void refreshArticles(); // 重取当前 feed 页，让新建/改动的文章反映到列表
+      if (!quiet) toast("文章已保存", "success");
+      return saved;
+    } catch (error) {
+      if (!quiet) toast(error instanceof Error ? error.message : "保存失败", "error");
+      return null;
+    } finally {
+      setLoading(false);
+      setStatusText("");
+    }
+  }
+
+  async function handleCoverUpload(file: File | null) {
+    if (!file) return;
+    const blobUrl = URL.createObjectURL(file);
+    setPendingCoverUrl(blobUrl);
+    setImageUploading((n) => n + 1);
+    try {
+      const asset = await uploadAssetRequest(file);
+      setPendingCoverUrl(null);
+      URL.revokeObjectURL(blobUrl);
+      setDraft((current) => ({ ...current, cover_asset_id: asset.id }));
+      if (draft.id) {
+        const saved = await updateArticleCover(draft.id, { cover_asset_id: asset.id, version: draft.version });
+        setSelectedArticle(saved);
+        setDraft((current) => ({ ...current, cover_asset_id: saved.cover_asset_id, version: saved.version }));
+        if (savedStateRef.current) {
+          savedStateRef.current = { ...savedStateRef.current, cover_asset_id: saved.cover_asset_id };
+        }
+        void refreshArticles(); // 封面变化反映到列表卡片
+        toast("封面已上传并保存", "success");
+      } else {
+        toast("封面已上传，保存文章后生效", "success");
+      }
+    } catch (error) {
+      setPendingCoverUrl(null);
+      URL.revokeObjectURL(blobUrl);
+      toast(error instanceof Error ? error.message : "封面上传失败", "error");
+    } finally {
+      setImageUploading((n) => n - 1);
+    }
+  }
+
+  async function handleBodyImageUploadSingle(file: File) {
+    if (!editor) return;
+
+    const blobUrl = URL.createObjectURL(file);
+    const tempAssetId = `pending-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    pendingBlobsRef.current.add(blobUrl);
+    editor.chain().focus().insertContent({
+      type: "image",
+      attrs: { src: blobUrl, alt: file.name, title: file.name, assetId: tempAssetId },
+    }).run();
+
+    setImageUploading((n) => n + 1);
+    try {
+      function updateNodeProgress(percent: number) {
+        const { state, view } = editor!;
+        let tr = state.tr;
+        state.doc.descendants((node, pos) => {
+          if (node.type.name === "image" && node.attrs.assetId === tempAssetId) {
+            tr = tr.setNodeMarkup(pos, undefined, { ...node.attrs, progress: percent });
+            return false;
+          }
+        });
+        if (tr.docChanged) view.dispatch(tr);
+      }
+
+      const asset = await uploadAssetRequest(file, updateNodeProgress);
+      const realSrc = withAssetToken(asset.url);
+
+      const { state, view } = editor;
+      let tr = state.tr;
+      state.doc.descendants((node, pos) => {
+        if (node.type.name === "image" && node.attrs.assetId === tempAssetId) {
+          tr = tr.setNodeMarkup(pos, undefined, { ...node.attrs, src: realSrc, assetId: asset.id, progress: null });
+          return false;
+        }
+      });
+      if (tr.docChanged) view.dispatch(tr);
+
+      pendingBlobsRef.current.delete(blobUrl);
+      URL.revokeObjectURL(blobUrl);
+    } catch (error) {
+      const { state, view } = editor;
+      let posFound = -1, sizeFound = 0;
+      state.doc.descendants((node, pos) => {
+        if (node.type.name === "image" && node.attrs.assetId === tempAssetId) {
+          posFound = pos; sizeFound = node.nodeSize; return false;
+        }
+      });
+      if (posFound >= 0) view.dispatch(state.tr.delete(posFound, posFound + sizeFound));
+      pendingBlobsRef.current.delete(blobUrl);
+      URL.revokeObjectURL(blobUrl);
+      toast(error instanceof Error ? error.message : "正文图片上传失败", "error");
+    } finally {
+      setImageUploading((n) => n - 1);
+    }
+  }
+
+  async function handleBodyImageUpload(files: File[]) {
+    if (!files.length || !editor) return;
+    await Promise.all(files.map((f) => handleBodyImageUploadSingle(f).catch(() => {})));
+    toast("正文图片已插入，请保存文章", "success");
+  }
+  pasteImageRef.current = (file: File) => void handleBodyImageUploadSingle(file);
+
+  async function saveArticle() {
+    await persistArticle();
+  }
+
+  async function deleteCurrentArticle() {
+    if (!draft.id) return;
+    setLoading(true);
+    setStatusText("删除中");
+    try {
+      const deletedId = draft.id;
+      await deleteArticle(deletedId);
+      resetDraft();
+      void refreshArticles(); // 重取当前页（内部会在删到空页时回退页码）
+      toast("文章已删除", "success");
+    } catch (error) {
+      toast(error instanceof Error ? error.message : "删除失败", "error");
+    } finally {
+      setLoading(false);
+      setStatusText("");
+    }
+  }
+
+  async function saveGroupFromSelection() {
+    const name = groupName.trim();
+    if (!name) {
+      toast("请输入分组名称", "error");
+      return;
+    }
+    setLoading(true);
+    try {
+      const group = editingGroupId
+        ? await updateArticleGroup(editingGroupId, { name, version: groups.find((item) => item.id === editingGroupId)?.version })
+        : await createArticleGroup({ name });
+      if (!editingGroupId && selectedArticleIds.length > 0) {
+        const payload: ArticleGroupUpdateItemsPayload = {
+          items: selectedArticleIds.map((articleId, index) => ({ article_id: articleId, sort_order: index })),
+        };
+        await updateArticleGroupItems(group.id, { ...payload, version: group.version });
+      }
+      const isEditing = Boolean(editingGroupId);
+      setGroupName("");
+      setEditingGroupId(null);
+      setSelectedArticleIds([]);
+      void manualRefresh(); // 新建/更新分组反映到 feed 列表 + 分组选择器
+      toast(isEditing ? "分组已更新" : "分组已创建", "success");
+    } catch (error) {
+      toast(error instanceof Error ? error.message : "保存分组失败", "error");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function deleteEditingGroup() {
+    if (!editingGroupId) return;
+    setLoading(true);
+    try {
+      const deletedGroupId = editingGroupId;
+      await deleteArticleGroup(deletedGroupId);
+      setEditingGroupId(null);
+      setGroupName("");
+      setSelectedArticleIds([]);
+      void manualRefresh(); // 删除分组反映到 feed 列表 + 分组选择器
+      toast("分组已删除", "success");
+    } catch (error) {
+      toast(error instanceof Error ? error.message : "删除分组失败", "error");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function loadGroup(group: ArticleGroup) {
+    setEditingGroupId(group.id);
+    setGroupName(group.name);
+    setSelectedArticleIds([]);
+  }
+
+  function toggleSelectedArticle(articleId: number) {
+    setSelectedArticleIds((current) =>
+      current.includes(articleId) ? current.filter((id) => id !== articleId) : [...current, articleId],
+    );
+  }
+
+  async function searchArticles() {
+    await refreshArticles(query, 0, reviewTab);
+  }
+
+  async function addArticleToGroup() {
+    if (!groupPickerArticle || !groupPickerSelectedId) return;
+    const group = groups.find((item) => item.id === groupPickerSelectedId);
+    if (!group) return;
+    setLoading(true);
+    try {
+      const payload: ArticleGroupUpdateItemsPayload = {
+        items: [
+          ...group.items.map((item) => ({ article_id: item.article_id, sort_order: item.sort_order })),
+          { article_id: groupPickerArticle.id, sort_order: group.items.length },
+        ],
+      };
+      await updateArticleGroupItems(group.id, { ...payload, version: group.version });
+      setGroupPickerArticle(null);
+      setGroupPickerSelectedId(null);
+      void manualRefresh(); // 加入分组后：feed 列表与分组选择器都需刷新（含新版本号）
+      toast("文章已加入分组", "success");
+    } catch (error) {
+      toast(error instanceof Error ? error.message : "加入分组失败", "error");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function removeArticleFromGroup(group: ArticleGroup, articleId: number) {
+    setLoading(true);
+    try {
+      const payload: ArticleGroupUpdateItemsPayload = {
+        items: group.items
+          .filter((item) => item.article_id !== articleId)
+          .map((item, index) => ({ article_id: item.article_id, sort_order: index })),
+      };
+      await updateArticleGroupItems(group.id, { ...payload, version: group.version });
+      void manualRefresh(); // 移出分组后：feed 列表与分组选择器都需刷新（含新版本号）
+      toast("文章已移出分组", "success");
+    } catch (error) {
+      toast(error instanceof Error ? error.message : "移出分组失败", "error");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function changeArticlePage(nextPage: number) {
+    const clamped = Math.min(Math.max(nextPage, 0), totalArticlePages - 1);
+    await refreshArticles(query, clamped, reviewTab);
+  }
+
+  function applyReviewedArticle(updated: Article) {
+    setSelectedArticle((prev) => (prev && prev.id === updated.id ? { ...prev, review_status: updated.review_status, version: updated.version } : prev));
+    setDraft((prev) => (prev.id === updated.id ? { ...prev, version: updated.version } : prev));
+    void refreshArticles(); // 审核后该文可能离开当前 tab，重取当前 feed 页 + counts
+  }
+
+  function selectReviewTab(tab: ReviewStatus) {
+    setSelectedArticleIds([]);
+    if (onReviewTabChange) {
+      // URL 驱动：navigate 后 reviewTabProp 变化 → 同步 effect 负责 setReviewTab + 重取，避免双取。
+      onReviewTabChange(tab);
+    } else {
+      setReviewTab(tab);
+      void refreshArticles(query, 0, tab);
+    }
+  }
+
+  async function approveOne(articleId: number) {
+    setReviewBusyId(articleId);
+    try {
+      const updated = await approveArticle(articleId);
+      applyReviewedArticle(updated);
+      toast("文章已通过审核", "success");
+    } catch (error) {
+      toast(error instanceof Error ? error.message : "审核失败", "error");
+    } finally {
+      setReviewBusyId(null);
+    }
+  }
+
+  async function revokeOne(articleId: number) {
+    setReviewBusyId(articleId);
+    try {
+      const updated = await revokeArticleApproval(articleId);
+      applyReviewedArticle(updated);
+      toast("已撤销审核", "success");
+    } catch (error) {
+      toast(error instanceof Error ? error.message : "撤销审核失败", "error");
+    } finally {
+      setReviewBusyId(null);
+    }
+  }
+
+  async function approveWholeGroup(group: ArticleGroup) {
+    setReviewBusyId(-group.id);
+    try {
+      const updated = await approveGroup(group.id);
+      const memberIds = new Set(updated.items.map((item) => item.article_id));
+      setSelectedArticle((prev) => (prev && memberIds.has(prev.id) ? { ...prev, review_status: "approved" } : prev));
+      void manualRefresh(); // 组内成员审核状态变化 + counts：重取 feed 页 + groups
+      toast("分组已全部通过审核", "success");
+    } catch (error) {
+      toast(error instanceof Error ? error.message : "分组审核失败", "error");
+    } finally {
+      setReviewBusyId(null);
+    }
+  }
+
+  function groupArticleSummaries(group: ArticleGroup): ArticleSummary[] {
+    return group.items
+      .slice()
+      .sort((a, b) => a.sort_order - b.sort_order)
+      .map((gi) => articleById[gi.article_id])
+      .filter((a): a is ArticleSummary => a !== undefined);
+  }
+
+  function openDistributeForGroup(group: ArticleGroup) {
+    setDistributeTarget({ kind: "group", groupId: group.id, name: group.name, articles: groupArticleSummaries(group) });
+  }
+
+  function openDistributeForSelection() {
+    const selected = selectedArticleIds
+      .map((id) => articleById[id])
+      .filter((a): a is ArticleSummary => a !== undefined);
+    if (selected.length === 0) return;
+    setDistributeTarget({ kind: "selection", articles: selected });
+  }
+
+  function openDistributeForCurrent() {
+    if (!selectedArticle) return;
+    setDistributeTarget({ kind: "article", article: selectedArticle });
+  }
+
+  const currentReviewStatus: ReviewStatus = selectedArticle?.review_status ?? "approved";
+  // 小红书图文：内容区改用专用轮播+文案预览（XhsNotePreview 自包含保存），
+  // 主 editor 仍照常挂载（hook 不条件调用）但不渲染其 EditorContent / 工具栏 / 顶部保存，避免双保存。
+  const isXhsArticle = selectedArticle?.content_type === "xhs_image_text";
+
+  return (
+    <>
+      <header className="topbar">
+        <div>
+          <p className="eyebrow">内容管理</p>
+          <h1>图文工作台</h1>
+        </div>
+        <div className="topActions">
+          <div className="statusHints">
+            {imageUploading > 0 && <span className="statusHint">图片传输中</span>}
+            {loading && statusText ? <span className="statusHint">{statusText}</span> : null}
+          </div>
+          {draft.id ? (
+            <button className="secondaryButton" type="button" onClick={() => void copyArticleLink(draft.id!)}>
+              复制链接
+            </button>
+          ) : null}
+          <button className="secondaryButton" disabled={refreshing} type="button" onClick={() => void manualRefresh()} title="拉取最新列表">
+            <RefreshCw size={16} className={refreshing ? "spin" : ""} />
+            刷新
+          </button>
+          {canEdit && (
+            <>
+              <button className="dangerButton" disabled={!draft.id || loading} type="button" onClick={() => setConfirmDeleteArticle(true)}>
+                <Trash2 size={16} />
+                删除
+              </button>
+              {!isXhsArticle && (
+                <button className="primaryButton" disabled={loading || imageUploading > 0} type="button" onClick={() => void saveArticle()}>
+                  <Save size={16} />
+                  保存
+                </button>
+              )}
+              <button className="secondaryButton" disabled={loading} type="button" onClick={() => { if (isDirty()) { setConfirmUnsavedNew(true); } else { resetDraft(); } }}>
+                <Plus size={16} />
+                新建
+              </button>
+            </>
+          )}
+        </div>
+      </header>
+
+      <section className="contentGrid">
+        <aside className="listPane">
+          {isMobile && (
+            <div className="reviewTabs">
+              <button
+                type="button"
+                className={`reviewTabBtn ${reviewTab === "pending" ? "active" : ""}`}
+                onClick={() => selectReviewTab("pending")}
+              >
+                未审核
+                <span className="reviewTabCount">{reviewCounts.pending}</span>
+              </button>
+              <button
+                type="button"
+                className={`reviewTabBtn ${reviewTab === "approved" ? "active" : ""}`}
+                onClick={() => selectReviewTab("approved")}
+              >
+                已审核
+                <span className="reviewTabCount">{reviewCounts.approved}</span>
+              </button>
+            </div>
+          )}
+
+          {reviewTab === "approved" && selectedArticleIds.length > 0 ? (
+            <div className="bulkBar">
+              <div className="bulkBarLeft">
+                <ListChecks size={16} />
+                <span>已选 {selectedArticleIds.length} 篇</span>
+              </div>
+              <div className="bulkBarRight">
+                <button type="button" className="bulkClearBtn" onClick={() => setSelectedArticleIds([])}>
+                  取消选择
+                </button>
+                <button type="button" className="bulkDistributeBtn" onClick={openDistributeForSelection}>
+                  <Send size={15} />
+                  自动分发
+                </button>
+              </div>
+            </div>
+          ) : null}
+
+          <div className="searchRow">
+            <Search size={16} />
+            <input value={query} placeholder="搜索标题或作者" onChange={(event) => setQuery(event.target.value)} />
+            <button type="button" onClick={searchArticles}>
+              搜索
+            </button>
+          </div>
+
+          <div className="articleList contentArticleList">
+            {pagedUnifiedList.map((item) => {
+              if (item.type === "article") {
+                return (
+                  <div className="articleRowWithAction" key={`a-${item.article.id}`}>
+                    <ArticleListItem
+                      article={item.article}
+                      draftId={draft.id}
+                      selectedIds={selectedArticleIds}
+                      onToggle={toggleSelectedArticle}
+                      onSelect={(article) => void loadArticleGuarded(() => loadArticle(article))}
+                    />
+                    <div className="articleRowActions">
+                      {item.article.review_status === "pending" ? (
+                        <button
+                          className="inlineMiniButton approveMiniButton"
+                          type="button"
+                          disabled={reviewBusyId === item.article.id}
+                          onClick={() => void approveOne(item.article.id)}
+                        >
+                          <Check size={13} />
+                          通过审核
+                        </button>
+                      ) : null}
+                      <button
+                        className="inlineMiniButton"
+                        type="button"
+                        onClick={() => {
+                          setGroupPickerArticle(item.article);
+                          setGroupPickerSelectedId(groups[0]?.id ?? null);
+                        }}
+                      >
+                        加入分组
+                      </button>
+                      <button
+                        className="inlineMiniButton"
+                        type="button"
+                        onClick={() => void copyArticleLink(item.article.id)}
+                      >
+                        复制链接
+                      </button>
+                    </div>
+                  </div>
+                );
+              }
+              const { group } = item;
+              const isExpanded = expandedGroupIds.has(group.id);
+              const counts = groupReviewCounts(group);
+              const fullyApproved = counts.total > 0 && counts.approved === counts.total;
+              // 只列当前标签状态的文章；另一侧成员数用于跨标签提示。
+              const groupArticles = groupArticleSummaries(group).filter(
+                (a) => a.review_status === reviewTab,
+              );
+              const otherCount =
+                reviewTab === "pending" ? counts.approved : counts.total - counts.approved;
+              return (
+                <div className="groupRowItem" key={`g-${group.id}`}>
+                  <div className={`groupRowHeader ${group.id === editingGroupId ? "selected" : ""}`}>
+                    <button
+                      className="groupRowToggle"
+                      type="button"
+                      onClick={() =>
+                        setExpandedGroupIds((prev) => {
+                          const next = new Set(prev);
+                          if (next.has(group.id)) next.delete(group.id);
+                          else next.add(group.id);
+                          return next;
+                        })
+                      }
+                    >
+                      <ChevronRight size={18} className={`groupRowChevron${isExpanded ? " open" : ""}`} />
+                      <span className="groupRowName">{group.name}</span>
+                      <small className="groupRowCount">{group.items.length} 篇</small>
+                    </button>
+                    <div className="groupRowReview">
+                      {counts.total > 0 ? (
+                        <span className={`badge ${fullyApproved ? "succeeded" : "waiting_manual_publish"}`}>
+                          {fullyApproved ? "全部已审核" : `${counts.approved}/${counts.total} 已审核`}
+                        </span>
+                      ) : null}
+                      {reviewTab === "approved" && fullyApproved ? (
+                        <button
+                          type="button"
+                          className="inlineMiniButton distributeMiniButton"
+                          onClick={() => openDistributeForGroup(group)}
+                        >
+                          <Send size={13} />
+                          自动分发
+                        </button>
+                      ) : reviewTab === "pending" && counts.total - counts.approved > 0 ? (
+                        <button
+                          type="button"
+                          className="inlineMiniButton approveMiniButton"
+                          disabled={reviewBusyId === -group.id}
+                          onClick={() => void approveWholeGroup(group)}
+                        >
+                          全部通过
+                        </button>
+                      ) : null}
+                    </div>
+                    <button className="groupRowEdit" type="button" onClick={() => loadGroup(group)}>
+                      编辑
+                    </button>
+                  </div>
+                  {isExpanded ? (
+                    <div className="groupRowArticles">
+                      {otherCount > 0 ? (
+                        <p className="groupCrossTabHint">
+                          另有 {otherCount} 篇{reviewTab === "pending" ? "已审核" : "待审核"}，
+                          切到「{reviewTab === "pending" ? "已审核" : "未审核"}」标签查看
+                        </p>
+                      ) : null}
+                      {groupArticles.map((article) => (
+                        <article
+                          className={`articleItem ${article.id === draft.id ? "selected" : ""}`}
+                          key={article.id}
+                        >
+                          <label className="checkLine">
+                            <input
+                              checked={selectedArticleIds.includes(article.id)}
+                              type="checkbox"
+                              onChange={() => toggleSelectedArticle(article.id)}
+                            />
+                          </label>
+                          <button type="button" onClick={() => void loadArticleGuarded(() => loadArticle(article))}>
+                            <span style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+                              <strong>{article.title}</strong>
+                              <span
+                                className="badge"
+                                style={{ flexShrink: 0, fontFamily: "var(--mono, monospace)", color: "var(--text-muted, #888)" }}
+                                title="数据库 ID"
+                              >
+                                ID {article.id}
+                              </span>
+                            </span>
+                            <span className="articleSourceLine">智能体：{article.source_agent_name || "—"}</span>
+                            <span className="articleSourceRow">
+                              <span className="articleSourceLine">{formatArticleTemplateSource(article)}</span>
+                              <small>
+                                {formatDateTime(article.updated_at)}
+                                {article.published_count > 0 ? <span style={{ color: "#16a34a", marginLeft: 6 }}>· 已发布 {article.published_count} 次</span> : null}
+                              </small>
+                            </span>
+                          </button>
+                          <div className="articleItemBadge">
+                            <ReviewBadge status={article.review_status} />
+                          </div>
+                          <button
+                            className="inlineMiniButton removeFromGroupButton"
+                            type="button"
+                            onClick={() => void removeArticleFromGroup(group, article.id)}
+                          >
+                            移出
+                          </button>
+                        </article>
+                      ))}
+                      {groupArticles.length === 0 && otherCount === 0 ? <p className="emptyText">分组暂无文章</p> : null}
+                    </div>
+                  ) : null}
+                </div>
+              );
+            })}
+            {unifiedList.length === 0 ? (
+              <p className="emptyText">{refreshing && feedItems.length === 0 ? "加载中…" : "暂无文章"}</p>
+            ) : null}
+          </div>
+
+          <Pagination
+            page={articlePage}
+            totalPages={totalArticlePages}
+            loading={loading}
+            onPrev={() => void changeArticlePage(articlePage - 1)}
+            onNext={() => void changeArticlePage(articlePage + 1)}
+          />
+
+          <section className="groupBox">
+            <h2>文章分组</h2>
+            <p style={{ fontSize: 12, color: "#64748b", margin: "0 0 8px" }}>
+              {editingGroupId ? "勾选左侧文章后点「更新」可增减分组内文章" : "勾选左侧文章后填写名称，点「创建」"}
+            </p>
+            <div className="groupCreate">
+              <input value={groupName} placeholder="分组名称" onChange={(event) => setGroupName(event.target.value)} />
+              <button type="button" onClick={saveGroupFromSelection}>
+                {editingGroupId ? "更新" : "创建"}
+              </button>
+            </div>
+            {editingGroupId ? (
+              <div className="groupEditActions">
+                <button type="button" onClick={() => { setEditingGroupId(null); setGroupName(""); setSelectedArticleIds([]); }}>
+                  取消编辑
+                </button>
+                <button type="button" onClick={() => setConfirmDeleteGroup(true)}>
+                  删除分组
+                </button>
+              </div>
+            ) : null}
+          </section>
+        </aside>
+
+        <section className="editorPane">
+          {selectedArticle && !canEdit && (
+            <div style={{ margin: "0 0 12px", padding: "8px 12px", borderRadius: 8, background: "#fff7ed", color: "#9a3412", fontSize: 13, border: "1px solid #fed7aa" }}>
+              你正在查看他人分享的文章，仅可阅读，无法编辑或审核。
+            </div>
+          )}
+          <div className="formRow split">
+            <label>
+              标题
+              <input value={draft.title} disabled={!canEdit || isXhsArticle} onChange={(event) => setDraft({ ...draft, title: event.target.value })} />
+            </label>
+            <label>
+              作者
+              <input value={draft.author} disabled={!canEdit || isXhsArticle} onChange={(event) => setDraft({ ...draft, author: event.target.value })} />
+            </label>
+            <label>
+              状态
+              <select value={draft.status} disabled={!canEdit || isXhsArticle} onChange={(event) => setDraft({ ...draft, status: event.target.value })}>
+                <option value="draft">草稿</option>
+                <option value="ready">待发布</option>
+                <option value="archived">归档</option>
+              </select>
+            </label>
+          </div>
+
+          <div className="metaRow">
+            <section className="coverRow">
+              <div className="coverPreview">
+                {(pendingCoverUrl ?? assetSrc(draft.cover_asset_id)) ? <img alt="封面" src={pendingCoverUrl ?? assetThumbSrc(draft.cover_asset_id) ?? assetSrc(draft.cover_asset_id)!} /> : <span>封面</span>}
+              </div>
+              {canEdit && (
+                <label className="fileButton">
+                  <Upload size={16} />
+                  上传封面
+                  <input accept="image/*" type="file" onChange={(event) => { void handleCoverUpload(event.target.files?.[0] ?? null); event.currentTarget.value = ""; }} />
+                </label>
+              )}
+              {selectedArticle ? <span className="metaText">正文图片 {selectedArticle.body_assets.length} 张</span> : null}
+            </section>
+
+            {selectedArticle && canEdit ? (
+              <div className={`reviewStrip ${currentReviewStatus === "approved" ? "approved" : "pending"}`}>
+                <div className="reviewStripLeft">
+                  <ShieldCheck size={18} />
+                  <div className="reviewStripText">
+                    <strong>{currentReviewStatus === "approved" ? "审核状态：已通过" : "审核状态"}</strong>
+                    <span>{currentReviewStatus === "approved" ? "该文章已可进入发布" : "通过审核后该文章方可进入发布"}</span>
+                  </div>
+                </div>
+                <div className="reviewStripActions">
+                  <ReviewBadge status={currentReviewStatus} />
+                  {currentReviewStatus === "approved" ? (
+                    <>
+                      <button
+                        type="button"
+                        className="secondaryButton reviewStripBtn"
+                        disabled={reviewBusyId === selectedArticle.id}
+                        onClick={() => void revokeOne(selectedArticle.id)}
+                      >
+                        撤销审核
+                      </button>
+                      <button type="button" className="reviewStripDistribute" onClick={openDistributeForCurrent}>
+                        <Send size={15} />
+                        自动分发
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      type="button"
+                      className="reviewStripApprove"
+                      disabled={reviewBusyId === selectedArticle.id}
+                      onClick={() => void approveOne(selectedArticle.id)}
+                    >
+                      <Check size={15} />
+                      通过审核
+                    </button>
+                  )}
+                </div>
+              </div>
+            ) : null}
+          </div>
+
+          {isXhsArticle && selectedArticle ? (
+            <XhsNotePreview
+              key={selectedArticle.id}
+              article={selectedArticle}
+              onSaved={() => void loadArticleById(selectedArticle.id)}
+              onDirtyChange={handleXhsDirty}
+            />
+          ) : (
+            <>
+              {canEdit && (
+                <EditorToolbar
+                  editor={editor}
+                  onImageUpload={handleBodyImageUpload}
+                  imageSelected={!!editor?.isActive("image")}
+                  onSaveImage={() => {
+                    const src = editor?.getAttributes("image").src as string | undefined;
+                    if (src) setSaveImageSrc(src);
+                    else toast("请先选中正文中的图片", "error");
+                  }}
+                />
+              )}
+              <div className="editorWrap paper-scope">
+                <EditorContent editor={editor} />
+              </div>
+              <div style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 8, padding: "4px 8px", fontSize: 12, color: charCount < 300 ? "#e67e22" : "#888" }}>
+                <span>正文字数：{charCount} 字</span>
+                {charCount < 300 && <span>（建议不少于 300 字）</span>}
+              </div>
+            </>
+          )}
+
+        </section>
+      </section>
+
+      {distributeTarget ? (
+        <DistributeModal
+          target={distributeTarget}
+          accounts={accounts}
+          onClose={() => setDistributeTarget(null)}
+          onDistributed={() => setSelectedArticleIds([])}
+        />
+      ) : null}
+
+      {saveImageSrc ? (
+        <ImageSaveDialog
+          imageSrc={saveImageSrc}
+          onClose={() => setSaveImageSrc(null)}
+          onSaved={(msg) => toast(msg, "success")}
+          onError={(msg) => toast(msg, "error")}
+        />
+      ) : null}
+
+      {groupPickerArticle ? (
+        <Modal
+          title="加入分组"
+          onClose={() => setGroupPickerArticle(null)}
+          footer={
+            <>
+              <button type="button" onClick={() => setGroupPickerArticle(null)}>
+                取消
+              </button>
+              <button type="button" disabled={!groupPickerSelectedId || loading} onClick={() => void addArticleToGroup()}>
+                加入
+              </button>
+            </>
+          }
+        >
+          <p style={{ margin: "0 0 12px", fontSize: 13, color: "#64748b" }}>{groupPickerArticle.title}</p>
+          <div className="groupPickerList">
+            {groups.map((group) => (
+              <label className="groupPickerOption" key={group.id}>
+                <input
+                  checked={groupPickerSelectedId === group.id}
+                  name="targetGroup"
+                  type="radio"
+                  onChange={() => setGroupPickerSelectedId(group.id)}
+                />
+                <span>{group.name}</span>
+                <small>{group.items.length} 篇</small>
+              </label>
+            ))}
+            {groups.length === 0 ? <p className="emptyText">暂无分组</p> : null}
+          </div>
+        </Modal>
+      ) : null}
+
+      {confirmDeleteArticle ? (
+        <Modal
+          title="确认删除文章？"
+          onClose={() => setConfirmDeleteArticle(false)}
+          footer={
+            <>
+              <button type="button" onClick={() => setConfirmDeleteArticle(false)}>取消</button>
+              <button type="button" className="dangerButton" disabled={loading} onClick={() => { setConfirmDeleteArticle(false); void deleteCurrentArticle(); }}>确认删除</button>
+            </>
+          }
+        >
+          <p>《{draft.title}》删除后不可恢复</p>
+        </Modal>
+      ) : null}
+
+      {confirmDeleteGroup ? (
+        <Modal
+          title="确认删除分组？"
+          onClose={() => setConfirmDeleteGroup(false)}
+          footer={
+            <>
+              <button type="button" onClick={() => setConfirmDeleteGroup(false)}>取消</button>
+              <button type="button" className="dangerButton" disabled={loading} onClick={() => { setConfirmDeleteGroup(false); void deleteEditingGroup(); }}>确认删除</button>
+            </>
+          }
+        >
+          <p>分组下文章的关联将被移除，文章本身不受影响</p>
+        </Modal>
+      ) : null}
+
+      {confirmUnsavedNew ? (
+        <Modal
+          title="当前有未保存的内容，确认放弃？"
+          onClose={() => setConfirmUnsavedNew(false)}
+          footer={
+            <>
+              <button type="button" onClick={() => setConfirmUnsavedNew(false)}>取消</button>
+              <button type="button" className="primaryButton" onClick={() => { setConfirmUnsavedNew(false); resetDraft(); }}>确认放弃</button>
+            </>
+          }
+        >
+          {null}
+        </Modal>
+      ) : null}
+    </>
+  );
+}

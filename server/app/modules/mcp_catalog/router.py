@@ -1,0 +1,394 @@
+"""MCP catalog 只读端点（挂在 /api/mcp 下，service token 鉴权）。
+
+复用各模块 service 层，给 Claude Code Loop 的 catalog tools 拉数据。无 per-user 过滤，
+MCP 调用按 service 视角返回全量；写操作仍走各模块自己的 MCP sub-router。
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
+from sqlalchemy import case, func, select
+from sqlalchemy.orm import Session
+
+from server.app.core.mcp_auth import require_mcp_token
+from server.app.db.session import get_db
+from server.app.modules.accounts.schemas import AccountRead, to_account_read
+from server.app.modules.accounts.service import list_accounts as svc_list_accounts
+from server.app.modules.ai_generation import question_bank as qb
+from server.app.modules.ai_generation.schemas import (
+    QuestionItemRead,
+    QuestionPoolRead,
+)
+from server.app.modules.articles import get_article as svc_get_article
+from server.app.modules.articles import list_articles as svc_list_articles
+from server.app.modules.articles import search_by_title as svc_search_by_title
+from server.app.modules.articles.generation_fingerprints import (
+    prompt_template_fingerprint,
+    question_item_fingerprint,
+)
+from server.app.modules.articles.schemas import (
+    ArticleListRead,
+    ArticleRead,
+    article_provenance_state,
+    to_article_read,
+)
+from server.app.modules.content_platforms import get_platform_content_policy
+from server.app.modules.image_library.models import StockCategory, StockImage
+from server.app.modules.pipelines.models import Pipeline
+from server.app.modules.prompt_templates.schemas import PromptScope, PromptTemplateRead
+from server.app.modules.prompt_templates.service import list_prompt_templates as svc_list_templates
+from server.app.modules.quality_reference.models import QualityReference
+from server.app.modules.tasks.models import PublishRecord
+
+router = APIRouter(dependencies=[Depends(require_mcp_token)])
+
+
+class McpQuestionItemRead(QuestionItemRead):
+    generation_fingerprint: str
+
+
+class McpPromptTemplateRead(PromptTemplateRead):
+    generation_fingerprint: str
+
+
+# ── articles ───────────────────────────────────────────────────────────────
+
+
+@router.get("/articles", response_model=list[ArticleListRead])
+def mcp_list_articles(
+    status: str | None = Query(default=None),
+    review_status: str | None = Query(default=None),
+    target_platform_code: str | None = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=100),
+    db: Session = Depends(get_db),
+) -> list[ArticleListRead]:
+    """[MCP] 列文章（service 视角，无 per-user 过滤）。"""
+    articles = svc_list_articles(
+        db,
+        query=None,
+        skip=0,
+        limit=limit,
+        user_id=None,
+        review_status=review_status,
+        target_platform_code=target_platform_code,
+    )
+    if status:
+        articles = [a for a in articles if a.status == status]
+    if not articles:
+        return []
+    article_ids = [a.id for a in articles]
+    rows = db.execute(
+        select(PublishRecord.article_id, func.count().label("cnt"))
+        .where(
+            PublishRecord.article_id.in_(article_ids),
+            PublishRecord.status == "succeeded",
+            PublishRecord.is_deleted == False,  # noqa: E712
+        )
+        .group_by(PublishRecord.article_id)
+    ).all()
+    published_counts: dict[int, int] = {aid: cnt for (aid, cnt) in rows}
+    return [
+        ArticleListRead(
+            id=a.id,
+            title=a.title,
+            author=a.author,
+            cover_asset_id=a.cover_asset_id,
+            word_count=a.word_count,
+            status=a.status,
+            version=a.version,
+            review_status=a.review_status,
+            published_count=published_counts.get(a.id, 0),
+            source_agent_name=a.source_agent_name,
+            source_template_name=a.source_template_name,
+            source_template_id=a.source_template_id,
+            target_platform_code=a.target_platform_code,
+            provenance_state=article_provenance_state(a),
+            platform_policy_version=(
+                a.generation_context.platform_policy_version
+                if a.generation_context is not None
+                else None
+            ),
+            content_type=a.content_type,
+            adversarial_score=a.adversarial_score,
+            created_at=a.created_at,
+            updated_at=a.updated_at,
+        )
+        for a in articles
+    ]
+
+
+_SEARCH_SNIPPET_CHARS = 100
+
+
+@router.get("/articles/search")
+def mcp_search_articles_by_title(
+    title: str = Query(...),
+    review_status: str = Query(default="approved"),
+    limit: int = Query(default=20, ge=1, le=100),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """[MCP] 按标题搜自有文章，主要给 adopt_quality_reference 挑候选。
+
+    默认只回 approved；review_status="all" 放开全部状态。返回带 already_adopted / snippet。
+    """
+    svc_rs = None if review_status == "all" else review_status
+    articles = svc_search_by_title(db, title=title, review_status=svc_rs, limit=limit)
+    if not articles:
+        return {"items": []}
+    ids = [a.id for a in articles]
+    adopted = {
+        aid
+        for (aid,) in db.execute(
+            select(QualityReference.article_id).where(QualityReference.article_id.in_(ids))
+        ).all()
+    }
+    return {
+        "items": [
+            {
+                "id": a.id,
+                "title": a.title,
+                "review_status": a.review_status,
+                "word_count": a.word_count,
+                "already_adopted": a.id in adopted,
+                "snippet": (a.plain_text or "")[:_SEARCH_SNIPPET_CHARS],
+                "created_at": a.created_at,
+            }
+            for a in articles
+        ]
+    }
+
+
+@router.get("/articles/{article_id:int}", response_model=ArticleRead)
+def mcp_get_article(
+    article_id: int,
+    include_generation_context: bool = Query(default=False),
+    db: Session = Depends(get_db),
+) -> ArticleRead:
+    """[MCP] 取单篇文章详情。"""
+    article = svc_get_article(db, article_id)
+    if article is None:
+        raise HTTPException(status_code=404, detail="文章不存在")
+    return to_article_read(
+        article,
+        include_generation_context=include_generation_context,
+    )
+
+
+# ── question pools ─────────────────────────────────────────────────────────
+
+
+@router.get("/question-pools", response_model=list[QuestionPoolRead])
+def mcp_list_question_pools(db: Session = Depends(get_db)) -> list[QuestionPoolRead]:
+    """[MCP] 列所有问题池（全员共享，无过滤）。"""
+    pools = qb.list_pools(db)
+    return [
+        QuestionPoolRead(
+            id=p.id,
+            name=p.name,
+            feishu_app_token=p.feishu_app_token,
+            feishu_table_id=p.feishu_table_id,
+            last_synced_at=p.last_synced_at,
+            created_at=p.created_at,
+            pending_count=len(qb.list_items(db, p.id)),
+            auto_sync_enabled=p.auto_sync_enabled,
+        )
+        for p in pools
+    ]
+
+
+@router.get(
+    "/question-pools/{pool_id}/items",
+    response_model=list[McpQuestionItemRead],
+)
+def mcp_list_question_items(
+    pool_id: int,
+    limit: int = Query(default=20, ge=1, le=100),
+    category: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+) -> list[McpQuestionItemRead]:
+    """[MCP] 列指定问题池的 active 问题项；`category` 留空=不过滤。"""
+    pool = qb.get_pool(db, pool_id)
+    if pool is None:
+        raise HTTPException(status_code=404, detail="问题池不存在")
+    items = qb.list_items(db, pool.id)
+    if category:
+        items = [it for it in items if it.category == category]
+    return [
+        McpQuestionItemRead(
+            **qb.question_item_to_read(item).model_dump(),
+            generation_fingerprint=question_item_fingerprint(item),
+        )
+        for item in items[:limit]
+    ]
+
+
+# ── prompt templates ───────────────────────────────────────────────────────
+
+
+@router.get("/prompt-templates", response_model=list[McpPromptTemplateRead])
+def mcp_list_prompt_templates(
+    scope: PromptScope | None = Query(default=None),
+    platform: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+) -> list[McpPromptTemplateRead]:
+    """[MCP] 列提示词模板：仅排除软删，且只返回"启用"的（关闭模板不递给 Loop）。
+
+    platform 传入时按「该 platform 专属 或 通用」过滤；不传返回全部平台。
+    """
+    templates = svc_list_templates(db, scope=scope, enabled_only=True, platform=platform)
+    return [
+        McpPromptTemplateRead(
+            **PromptTemplateRead.model_validate(template).model_dump(),
+            generation_fingerprint=prompt_template_fingerprint(template),
+        )
+        for template in templates
+    ]
+
+
+@router.get("/content-platforms/{platform_code}/policy")
+def mcp_get_platform_content_policy(
+    platform_code: str,
+    version: str | None = Query(default=None),
+) -> dict[str, object]:
+    """[MCP] 返回目标内容平台 active 或指定版本的机器可读政策。"""
+    return get_platform_content_policy(platform_code, version=version)
+
+
+# ── pipelines ──────────────────────────────────────────────────────────────
+
+
+@router.get("/pipelines")
+def mcp_list_pipelines(
+    type_filter: str | None = Query(default=None, alias="type"),
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    """[MCP] 列 pipelines（service 视角，无 per-user 过滤）。返回轻量字段。"""
+    pipelines = list(db.execute(select(Pipeline).order_by(Pipeline.id.desc())).scalars().all())
+    if type_filter:
+        pipelines = [p for p in pipelines if (p.type or "general") == type_filter]
+    return [
+        {
+            "id": p.id,
+            "name": p.name,
+            "description": p.description,
+            "type": p.type or "general",
+            "is_enabled": p.is_enabled,
+            "schedule_kind": p.schedule_kind,
+        }
+        for p in pipelines
+    ]
+
+
+# ── accounts ───────────────────────────────────────────────────────────────
+
+
+@router.get("/accounts", response_model=list[AccountRead])
+def mcp_list_accounts(
+    platform_code: str | None = Query(default=None),
+    distribution_enabled: bool | None = Query(default=None),
+    db: Session = Depends(get_db),
+) -> list[AccountRead]:
+    """[MCP] 列账号（service 视角）。可按平台 / 分发开关过滤。"""
+    accounts = svc_list_accounts(db, q=None)
+    if platform_code:
+        accounts = [a for a in accounts if a.platform.code == platform_code]
+    if distribution_enabled is not None:
+        accounts = [a for a in accounts if a.distribution_enabled == distribution_enabled]
+    return [to_account_read(a) for a in accounts]
+
+
+# ── stock-categories ───────────────────────────────────────────────────────
+
+
+class StockCategoryRead(BaseModel):
+    id: int
+    name: str
+    kind: str
+    description: str | None
+    official_url: str | None
+    image_count: int
+
+
+@router.get("/stock-categories", response_model=list[StockCategoryRead])
+def mcp_list_stock_categories(
+    kind: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+) -> list[StockCategoryRead]:
+    """[MCP] 列图库栏目（service 视角，无 per-user 过滤）.
+
+    给 /goal Loop onboarding 用——使用者填 main_category_id 前先让 Claude
+    调本工具看候选栏目. kind 过滤：'main' / 'companion' / None=全量.
+    """
+    # COUNT(StockImage) per category via subquery —— 一次 SQL 避免 N+1
+    count_subq = (
+        select(StockImage.category_id, func.count(StockImage.id).label("cnt"))
+        .group_by(StockImage.category_id)
+        .subquery()
+    )
+    # kind 排序：main 优先（priority 0），companion / 其它在后（priority 1），同 kind 内按 id 升序.
+    kind_priority = case((StockCategory.kind == "main", 0), else_=1)
+    q = (
+        db.query(StockCategory, func.coalesce(count_subq.c.cnt, 0).label("image_count"))
+        .outerjoin(count_subq, count_subq.c.category_id == StockCategory.id)
+        .order_by(kind_priority.asc(), StockCategory.id.asc())
+    )
+    if kind:
+        q = q.filter(StockCategory.kind == kind)
+
+    rows = q.all()
+    return [
+        StockCategoryRead(
+            id=cat.id,
+            name=cat.name,
+            kind=cat.kind,
+            description=cat.description,
+            official_url=cat.official_url,
+            image_count=int(image_count),
+        )
+        for cat, image_count in rows
+    ]
+
+
+# ── stock-images ──────────────────────────────────────────────────────────
+
+
+class StockImageBrief(BaseModel):
+    asset_id: int
+    filename: str
+    tags: list[str]
+    url: str
+    w: int | None
+    h: int | None
+
+
+@router.get("/stock-images", response_model=list[StockImageBrief])
+def mcp_list_stock_images(
+    category_id: int = Query(...),
+    limit: int = Query(default=50, ge=1, le=200),
+    db: Session = Depends(get_db),
+) -> list[StockImageBrief]:
+    """[MCP] 列某栏目下的图，供 Claude 在 storyboard 里点名 asset_id。
+
+    只返回轻量字段（含 filename/tags 供无像素判断选图）。url 是公开代理地址。
+    """
+    rows = (
+        db.query(StockImage)
+        .filter(StockImage.category_id == category_id)
+        .order_by(StockImage.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        StockImageBrief(
+            asset_id=img.id,
+            filename=img.filename,
+            tags=img.tags or [],
+            url=f"/api/stock-images/{img.id}/file",
+            w=img.width,
+            h=img.height,
+        )
+        for img in rows
+    ]

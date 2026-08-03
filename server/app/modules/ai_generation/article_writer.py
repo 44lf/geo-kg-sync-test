@@ -1,0 +1,423 @@
+"""方案流生文内核：与会话、方案、LangGraph 解耦的可复用单元。
+
+未来自动化工作流可把"生成一篇文章"当作一个节点直接复用本函数——它只依赖
+（模板内容 + 问题文本 + 用户 ID + 会话工厂），不感知方案、运行或会话。
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+import uuid
+from collections.abc import Callable
+from types import SimpleNamespace
+from typing import Any
+
+from server.app.core.logging import add_run_tokens
+
+logger = logging.getLogger(__name__)
+
+_QUESTION_PLACEHOLDER = "{{问题}}"
+
+_GENERIC_SYSTEM_PROMPT = (
+    "你是一位专业的内容写作者。根据下方的写作要求，撰写一篇高质量的文章。"
+    "使用 Markdown 格式输出正文。"
+    "输出的第一行必须是文章标题，格式为 `# 标题`（井号后留一个空格、再写标题），"
+    "标题之前不要有任何前言、说明或代码块标记。"
+)
+
+
+def render_question_prompt(template_content: str, question_text: str) -> str:
+    """把问题文本注入模板。
+
+    - 含 {{问题}} 占位符：仅替换占位符（高级用法，问题插入位置由产品自定）。
+    - 不含占位符：把编号问题块前置到模板正文之前，桥接句带问题条数。
+    - 问题为空：只返回模板正文，不插入问题块。
+
+    `question_text` 已由上游（format_question_group / _render_questions）渲染成
+    "1. …\n2. …" 编号列表；这里只负责拼接，不再编号。
+    """
+    if _QUESTION_PLACEHOLDER in template_content:
+        return template_content.replace(_QUESTION_PLACEHOLDER, question_text)
+    if not question_text.strip():
+        return template_content
+    n = len(re.findall(r"(?m)^\s*\d+\.", question_text))
+    return (
+        f"基于以下 {n} 个问题，结合参考这些问题生成 1 篇文章：\n\n"
+        f"{question_text}\n\n{template_content}"
+    )
+
+
+_HEADING_RE = re.compile(r"^#{1,6}\s*(.*)$")
+_BOLD_TITLE_RE = re.compile(r"^\*\*(.+?)\*\*$")
+_FALLBACK_TITLE_MAX = 60
+_TITLE_MAX = 300  # 与 Article.title String(300) / ArticleCreate max_length 对齐
+
+
+def _truncate_title(text: str, limit: int) -> str:
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _first_nonblank_index(lines: list[str], start: int = 0) -> int:
+    i = start
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    return i
+
+
+def _strip_code_fence(lines: list[str]) -> list[str]:
+    """模型常把整篇输出包进 ``` 代码围栏。剥掉开头围栏行及其末尾配对围栏行。"""
+    start = _first_nonblank_index(lines)
+    if start >= len(lines) or not lines[start].lstrip().startswith("```"):
+        return lines
+    trimmed = lines[:start] + lines[start + 1 :]
+    end = len(trimmed) - 1
+    while end >= 0 and not trimmed[end].strip():
+        end -= 1
+    if end >= 0 and trimmed[end].strip() == "```":
+        trimmed = trimmed[:end] + trimmed[end + 1 :]
+    return trimmed
+
+
+def extract_title_and_body(md_content: str) -> tuple[str, str]:
+    """从模型 Markdown 输出里稳健抽取 (标题, 正文)。
+
+    原逻辑只认第一行精确 "# "，模型一旦吐 ##/无空格/加粗/代码围栏/空标题，标题就退化
+    成「无题」。这里按容错优先级抽取：
+    1. 剥掉整篇外层 ``` 代码围栏；
+    2. 首个非空行是任意级 heading（`#`~`######`，允许井号后无空格）→ 取其文本为标题、
+       从正文剔除该行；空标题标记（如 "# "）则跳过、继续往下找；
+    3. 首个非空行是整行加粗 `**标题**` → 取内层为标题、剔除该行；
+    4. 兜底：用首个非空行文本当标题（截断），但**正文完整保留该行**，绝不丢内容；
+    5. 通篇为空 → 才回落「无题」。
+
+    标题非空且 ≤300（schema 上限）；兜底标题再额外截到 60 以免整段长句当标题。
+    """
+    text = (md_content or "").strip()
+    if not text:
+        return "无题", ""
+
+    lines = _strip_code_fence(text.splitlines())
+    i = _first_nonblank_index(lines)
+    if i >= len(lines):
+        return "无题", ""
+
+    first = lines[i].strip()
+    heading = _HEADING_RE.match(first)
+    if heading is not None:
+        inner = heading.group(1).strip()
+        if inner:
+            body = "\n".join(lines[i + 1 :]).strip()
+            return _truncate_title(inner, _TITLE_MAX), body
+        # 空标题标记（"# " / "#"）：丢弃该行，从下一非空行重新判定
+        lines = lines[i + 1 :]
+        i = _first_nonblank_index(lines)
+        if i >= len(lines):
+            return "无题", ""
+        first = lines[i].strip()
+
+    bold = _BOLD_TITLE_RE.match(first)
+    if bold is not None and bold.group(1).strip():
+        body = "\n".join(lines[i + 1 :]).strip()
+        return _truncate_title(bold.group(1), _TITLE_MAX), body
+
+    # 兜底：首个非空行当标题，正文保留全文（含该行）——只取标题不剜内容
+    body = "\n".join(lines[i:]).strip()
+    return _truncate_title(first, _FALLBACK_TITLE_MAX), body
+
+
+# 取 ```json 围栏块；仅当解析为含 list 型 "games" 的 dict（=我们的哨兵）才认。
+# 注：与 ai_format.py:_extract_json 正则近似，但本函数要 span（剥块）+ 最后一个 +
+# games 键校验，契约不同，故另写小函数、不跨模块耦合那个私有 helper。
+_GAMES_FENCE_RE = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL)
+
+
+def _split_games_block(md_content: str) -> tuple[str, list[str]]:
+    """从模型输出尾部抽 {"games":[...]} 哨兵块 → (剥离后的正文, 游戏名列表)。
+
+    - 仅识别最后一个 ```json 围栏；解析为 dict 且含 list 型 "games" 才认（剥块 + 取名）。
+    - 非哨兵 / 坏 JSON / 无块 → 原样返回正文 + []（零回归，绝不误吃正文里的代码块）。
+    """
+    text = md_content or ""
+    matches = list(_GAMES_FENCE_RE.finditer(text))
+    if not matches:
+        return text, []
+    m = matches[-1]
+    try:
+        obj = json.loads(m.group(1))
+    except (ValueError, TypeError):
+        return text, []
+    if not isinstance(obj, dict) or not isinstance(obj.get("games"), list):
+        return text, []
+    games = [str(g).strip() for g in obj["games"] if str(g).strip()]
+    body = (text[: m.start()] + text[m.end() :]).strip()
+    return body, games
+
+
+def generate_article_from_prompt(
+    *,
+    session_factory: Callable[[], Any],
+    user_id: int,
+    template_content: str,
+    question_text: str,
+    model: str | None = None,
+    source_agent_name: str | None = None,
+    source_template_name: str | None = None,
+    source_template_id: int | None = None,
+    source_template_fingerprint: str | None = None,
+    target_platform_code: str | None = None,
+    platform_policy_version: str | None = None,
+    web_search: bool = False,
+    deep_thinking: bool = False,
+) -> int:
+    """组装提示词 → 调用 LLM → 取标题 → 转 Tiptap/HTML → create_article。返回 article_id。
+
+    通用系统提示词（不拼 Skill）。`model` 为方案级 AI 引擎覆盖（None / 空 = 用 settings.ai_model）。
+    `source_agent_name` / `source_template_name` 为生文溯源（智能体名 / 模板名），仅落库供列表展示。
+    `web_search` / `deep_thinking` 为「模型能力」开关（默认关；ai_compose 节点按 config 开启），
+    经 model_capabilities 按 provider 映射到 litellm 调用，best-effort、不支持/失败即回退普通生文。
+    异常向上抛（由调用方记任务失败）。每次调用自带独立会话。
+    """
+    import litellm
+
+    from server.app.modules.ai_generation.converter import markdown_to_html, markdown_to_tiptap
+    from server.app.modules.ai_generation.markdown_sanitizer import normalize_markdown_content
+    from server.app.modules.ai_generation.model_capabilities import completion_with_capabilities
+    from server.app.modules.ai_models.service import resolve_writing_engine
+    from server.app.modules.articles.generation_fingerprints import (
+        prompt_template_fingerprint,
+    )
+    from server.app.modules.articles.provenance import (
+        GenerationContextSpec,
+        build_generation_context,
+        validate_effective_prompt_snapshot,
+        validate_generation_metadata_text,
+        validate_generation_template,
+    )
+    from server.app.modules.articles.schemas import ArticleCreate
+    from server.app.modules.articles.service import create_article
+    from server.app.modules.content_platforms import (
+        get_platform_content_policy,
+        validate_article_for_platform,
+    )
+    from server.app.modules.prompt_templates.models import PromptTemplate
+    from server.app.shared.errors import ValidationError
+
+    # 模型与模板快照用短生命周期 session 实时读，绝不跨后面的 litellm 调用持有连接。
+    # 模板正文使用调用方刚从服务端模板行选出的实际值，避免 LLM 调用期间模板被编辑后，
+    # 保存出的 snapshot 错误声称使用了新版本。
+    template_snapshot = None
+    _resolve_db = session_factory()
+    try:
+        model_str, api_key, base_url = resolve_writing_engine(_resolve_db, model)
+        template_row = (
+            _resolve_db.get(PromptTemplate, source_template_id)
+            if source_template_id is not None
+            else None
+        )
+        if source_template_id is not None and template_row is None:
+            raise ValidationError(f"Prompt template not found: {source_template_id}")
+        if template_row is not None:
+            current_fingerprint = prompt_template_fingerprint(template_row)
+            if (
+                source_template_fingerprint is not None
+                and source_template_fingerprint != current_fingerprint
+            ):
+                raise ValidationError("prompt template changed after pipeline selection")
+            if template_content != template_row.content or (
+                source_template_name is not None and source_template_name != template_row.name
+            ):
+                raise ValidationError("prompt template changed after pipeline selection")
+        template_snapshot = SimpleNamespace(
+            id=source_template_id,
+            name=(
+                template_row.name
+                if template_row is not None
+                else (source_template_name or "pipeline-inline-template")
+            ),
+            content=(template_row.content if template_row is not None else template_content),
+            updated_at=(template_row.updated_at if template_row is not None else None),
+            scope=(template_row.scope if template_row is not None else "generation"),
+            platform=(template_row.platform if template_row is not None else None),
+            is_enabled=(template_row.is_enabled if template_row is not None else True),
+            is_deleted=(template_row.is_deleted if template_row is not None else False),
+        )
+    finally:
+        _resolve_db.close()
+
+    additional_secret_values = (api_key,) if api_key else ()
+    validate_generation_metadata_text(
+        str(template_snapshot.name),
+        field_name="prompt_template_name",
+        additional_secret_values=additional_secret_values,
+    )
+    validate_generation_metadata_text(
+        str(template_snapshot.content),
+        field_name="prompt_template_content",
+        additional_secret_values=additional_secret_values,
+    )
+    validate_generation_metadata_text(
+        model_str,
+        field_name="model_label",
+        additional_secret_values=additional_secret_values,
+    )
+
+    resolved_policy = None
+    if target_platform_code is not None:
+        validate_generation_template(template_snapshot, target_platform_code)
+        resolved_policy = get_platform_content_policy(
+            target_platform_code,
+            version=platform_policy_version,
+        )
+
+    user_prompt = (
+        render_question_prompt(template_content, question_text)
+        + "\n\n请开始写作。第一行必须是 `# 标题`（井号后留一个空格）。"
+        "正文写完后，**若本文是“每款游戏各占一个小标题”的盘点 / 推荐类文章**，"
+        "在正文之后另起一行追加一个 json 代码块，按小标题顺序列出每个小标题对应的"
+        "规范游戏中文名（与小标题一致即可，带不带《》/“游戏N、”前缀都行，后端会归一化匹配）：\n"
+        '```json\n{"games": ["原神", "明日方舟"]}\n```\n'
+        '若是没有分款小标题的散文 / 综述，则追加 `{"games": []}`。'
+        "该 json 块只用于自动配图、不展示给读者；除此之外不要输出任何前言、解释或额外代码块。"
+    )
+    if resolved_policy is not None:
+        user_prompt += (
+            "\n\n目标内容平台："
+            f"{target_platform_code}。以下为必须遵守的机器可读平台硬规则；"
+            "输出标题和正文前先逐项自检：\n"
+            + json.dumps(
+                resolved_policy,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+    effective_prompt = json.dumps(
+        {
+            "messages": [
+                {"role": "system", "content": _GENERIC_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ]
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    # Security preflight must happen before any external model call. Include the
+    # actually resolved DB/env model key, which is not necessarily present in
+    # static Settings fields.
+    validate_effective_prompt_snapshot(
+        effective_prompt,
+        additional_secret_values=additional_secret_values,
+    )
+    response = completion_with_capabilities(
+        completion=litellm.completion,
+        base_kwargs={
+            "model": model_str,
+            "messages": [
+                {"role": "system", "content": _GENERIC_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            "api_key": api_key or None,
+            "api_base": base_url or None,
+            "timeout": 300,
+            "max_tokens": 12000,
+        },
+        model=model_str,
+        web_search=web_search,
+        deep_thinking=deep_thinking,
+        logger=logger,
+    )
+    # [TOKEN统计] 写作模型 usage 取自 litellm 返回：打一行逐次明细 + 累加到运行汇总（见 executor 的 [TOKEN汇总]）。
+    _u = getattr(response, "usage", None)
+    _pt = getattr(_u, "prompt_tokens", None)
+    _ct = getattr(_u, "completion_tokens", None)
+    _tt = getattr(_u, "total_tokens", None)
+    logger.info(
+        "[TOKEN统计] 写作 model=%s prompt=%s completion=%s total=%s", model_str, _pt, _ct, _tt
+    )
+    add_run_tokens("write", prompt=_pt, completion=_ct, total=_tt)
+
+    md_content = response.choices[0].message.content or ""
+
+    # 先剥掉模型尾部的 {"games":[...]} 哨兵块，再抽标题正文（否则 json 块会泄进正文）
+    article_body, game_names = _split_games_block(md_content)
+    game_list = [{"game": g} for g in game_names] or None
+
+    title, body_md = extract_title_and_body(article_body)
+    body_md = normalize_markdown_content(body_md)
+    if target_platform_code is not None:
+        validate_article_for_platform(
+            target_platform_code,
+            title=title,
+            plain_text=body_md,
+            policy_version=(
+                str(resolved_policy["version"]) if resolved_policy is not None else None
+            ),
+        )
+
+    article_payload = ArticleCreate(
+        title=title,
+        content_json=markdown_to_tiptap(body_md),
+        content_html=markdown_to_html(body_md),
+        plain_text=body_md,
+        word_count=len(body_md),
+        client_request_id=str(uuid.uuid4()),
+        target_platform_code=target_platform_code,
+    )
+
+    db = session_factory()
+    try:
+        article = create_article(db, user_id, article_payload)
+        # AI 生文一律未审：不依赖运行后的 mark_pending_and_group 翻转
+        article.review_status = "pending"
+        # 生文溯源：去规范化存名字，供未审核库 / 列表卡片直接展示
+        article.source_agent_name = source_agent_name
+        article.source_template_name = source_template_name
+        article.source_template_id = source_template_id
+        article.target_platform_code = target_platform_code
+        # 显式游戏清单：盘点 / 推荐文写完顺手吐的 game_list 盖进 metrics，供配图侧走确定性落图
+        # （散文 / 无块 → game_list None → 不盖 → 消费侧回退现有 run_ai_format，零回归）
+        if game_list:
+            article.metrics = {**(article.metrics or {}), "game_positions": game_list}
+        if target_platform_code is not None:
+            policy = resolved_policy or get_platform_content_policy(
+                target_platform_code,
+                version=platform_policy_version,
+            )
+            context = build_generation_context(
+                article_id=article.id,
+                target_platform_code=target_platform_code,
+                template=template_snapshot,
+                question_item=None,
+                model_label=model_str,
+                spec=GenerationContextSpec(
+                    entrypoint="pipeline",
+                    effective_prompt=effective_prompt,
+                    platform_policy_version=str(policy["version"]),
+                    generation_params={
+                        "max_tokens": 12000,
+                        "timeout": 300,
+                        "web_search": web_search,
+                        "deep_thinking": deep_thinking,
+                    },
+                    evidence_refs=(
+                        {"rendered_question_text": question_text} if question_text else None
+                    ),
+                    question_snapshot=(
+                        {"rendered_question_text": question_text} if question_text else None
+                    ),
+                    additional_secret_values=additional_secret_values,
+                ),
+            )
+            article.generation_context = context
+            db.add(context)
+        db.commit()
+        return article.id
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()

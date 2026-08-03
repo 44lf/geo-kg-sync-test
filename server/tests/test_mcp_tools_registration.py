@@ -1,0 +1,51 @@
+"""MCP 工具注册守卫：关键工具已注册 + 注册总数 ≥ MCP_TOOLS_COUNT。"""
+
+
+def test_list_skills_tool_registered():
+    import server.mcp.tools.action  # noqa: F401  触发注册
+    import server.mcp.tools.catalog  # noqa: F401
+    from server.mcp.server import mcp
+
+    names = set(mcp._tool_manager._tools.keys())
+    assert "list_skills" in names
+    assert "install_loop_skills" in names
+
+
+def test_registered_count_meets_floor():
+    import server.mcp.tools.action  # noqa: F401
+    import server.mcp.tools.catalog  # noqa: F401
+    import server.mcp.tools.meta  # noqa: F401
+    from server.app.modules.mcp_catalog.connect_router import MCP_TOOLS_COUNT
+    from server.mcp.server import mcp
+
+    assert len(mcp._tool_manager._tools) >= MCP_TOOLS_COUNT
+    assert MCP_TOOLS_COUNT == 40
+
+
+def test_platform_content_policy_tool_registered():
+    import server.mcp.tools.catalog  # noqa: F401  触发注册
+    from server.mcp.server import mcp
+
+    assert "get_platform_content_policy" in mcp._tool_manager._tools
+
+
+def test_search_articles_by_title_tool_registered():
+    import server.mcp.tools.catalog  # noqa: F401  触发注册
+    from server.mcp.server import mcp
+
+    assert "search_articles_by_title" in mcp._tool_manager._tools
+
+
+def test_template_performance_tool_registered():
+    import server.mcp.tools.meta  # noqa: F401  触发注册
+    from server.mcp.server import mcp
+
+    assert "get_template_performance" in mcp._tool_manager._tools
+
+
+def test_game_library_tools_registered():
+    import server.mcp.tools.catalog  # noqa: F401  触发注册
+    from server.mcp.server import mcp
+
+    assert "list_game_tags" in mcp._tool_manager._tools
+    assert "query_games_by_tags" in mcp._tool_manager._tools

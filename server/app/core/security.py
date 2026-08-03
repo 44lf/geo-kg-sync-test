@@ -1,0 +1,138 @@
+"""JWT 鉴权工具：签发 / 校验 access_token，以及 get_current_user 依赖。
+
+令牌走 httpOnly Cookie `access_token`（见 auth_router）。get_current_user 带一层
+内存用户缓存（60 秒有效期），避免每个请求查一次数据库；用户被禁用 / 改密码时由
+invalidate_user_cache 主动失效。require_local_token 是死代码（无路由依赖，勿照抄）。
+"""
+
+import hmac
+import os
+import time
+from datetime import UTC, datetime, timedelta
+
+from fastapi import Depends, HTTPException, Request
+from jose import jwt
+
+from server.app.modules.system.models import User
+
+JWT_ALGORITHM = "HS256"
+
+# 内存用户缓存：避免每个请求都查一次数据库
+# 键=user_id，值=(已脱钩的 User 对象，过期 monotonic 时间)
+_user_cache: dict[int, tuple[User, float]] = {}
+_USER_CACHE_TTL = 60.0  # 60 秒有效期，对 5 人内部平台足够
+
+
+def _get_cached_user(user_id: int) -> User | None:
+    entry = _user_cache.get(user_id)
+    if entry and time.monotonic() < entry[1]:
+        return entry[0]
+    return None
+
+
+def invalidate_user_cache(user_id: int) -> None:
+    """用户状态变更时（禁用/改密码）主动清除缓存。"""
+    _user_cache.pop(user_id, None)
+
+
+def _reset_user_cache() -> None:
+    """测试隔离用：清除全部缓存条目。"""
+    _user_cache.clear()
+
+
+def _get_jwt_secret() -> str:
+    from server.app.core.config import get_settings
+
+    return get_settings().jwt_secret
+
+
+def _get_jwt_expire_hours() -> int:
+    return int(os.environ.get("GEO_JWT_EXPIRE_HOURS", "8"))
+
+
+def create_access_token(user_id: int, role: str) -> str:
+    expire = datetime.now(UTC) + timedelta(hours=_get_jwt_expire_hours())
+    payload = {"sub": str(user_id), "role": role, "exp": expire}
+    return jwt.encode(payload, _get_jwt_secret(), algorithm=JWT_ALGORITHM)
+
+
+def set_access_cookie(response, token: str) -> None:
+    """把 access_token 写成 httpOnly cookie。login 与飞书免登共用，保证标志一致。"""
+    from server.app.core.config import get_settings
+
+    response.set_cookie(
+        key="access_token",
+        value=token,
+        httponly=True,
+        samesite="lax",
+        path="/",
+        max_age=_get_jwt_expire_hours() * 3600,
+        secure=get_settings().secure_cookie,
+    )
+
+
+def verify_token(token: str) -> dict | None:
+    try:
+        return jwt.decode(token, _get_jwt_secret(), algorithms=[JWT_ALGORITHM])
+    except Exception:
+        return None
+
+
+def get_current_user(request: Request) -> User:
+    """从 Cookie 解析 JWT 并返回当前用户；命中缓存则跳过数据库查询。
+
+    校验顺序：缺令牌 → 401；令牌无效 / 过期 → 401；用户不存在 → 401；
+    被禁用 → 403；待改密码 → 403。返回的 User 是脱钩对象（detached）。
+    """
+    from sqlalchemy.orm import Session
+
+    from server.app.db.session import SessionLocal
+
+    token = request.cookies.get("access_token")
+    if not token:
+        raise HTTPException(status_code=401, detail="未登录，请重新登录")
+    payload = verify_token(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="登录已过期，请重新登录")
+
+    user_id = int(payload["sub"])
+    user = _get_cached_user(user_id)
+
+    if user is None:
+        db: Session = SessionLocal()
+        try:
+            user = db.get(User, user_id)
+            if not user:
+                raise HTTPException(status_code=401, detail="用户不存在")
+            # 从 Session 中脱钩后缓存，User 没有懒加载关联，脱钩后列值仍可访问
+            db.expunge(user)
+            _user_cache[user_id] = (user, time.monotonic() + _USER_CACHE_TTL)
+        finally:
+            db.close()
+
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="账号已被禁用")
+    if user.must_change_password:
+        raise HTTPException(status_code=403, detail="Password change required")
+    return user
+
+
+async def require_admin(current_user: User = Depends(get_current_user)) -> User:
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="需要管理员权限")
+    return current_user
+
+
+# 注意：此函数当前未使用（没有路由依赖它）。
+# 仅为未来可能的本地令牌鉴权保留；若长期未采用，可以删除。
+async def require_local_token(request: Request) -> None:
+    token = os.environ.get("GEO_LOCAL_API_TOKEN")
+    if not token:
+        return
+
+    received = request.headers.get("X-Geo-Token")
+    if not received:
+        raise HTTPException(status_code=401, detail="缺少认证令牌")
+
+    if not hmac.compare_digest(token, received):
+        raise HTTPException(status_code=401, detail="无效的认证令牌")
