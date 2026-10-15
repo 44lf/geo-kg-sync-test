@@ -13,7 +13,7 @@ The production importer must run inside the GEO application container so its exi
 MinIO configuration remains authoritative.
 
 The Windows implementation is maintained in the separate
-`https://hlgit.5518game.com/geo/geo-taptap-collector` repository. This GEO change owns only the
+`https://git.example.com/geo/geo-taptap-collector` repository. This GEO change owns only the
 consumer contract, target export, production validation, and import behavior.
 
 ## Goals / Non-Goals

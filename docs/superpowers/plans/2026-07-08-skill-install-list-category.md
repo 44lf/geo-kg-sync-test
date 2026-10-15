@@ -21,7 +21,7 @@
 - **迁移**：新 revision `0059_skill_category`，`down_revision="0058_skill_library"`。
 - **测试环境**（后端 pytest 前 export；见 `.superpowers/sdd/backend-env.md` 惯例）：
   - `PY = C:/Users/Administrator/miniconda3/envs/geo_xzpt/python.exe`
-  - `GEO_TEST_DATABASE_URL = mysql+pymysql://root:<GEO_DB_PASS>@172.25.20.57:3307/geo_test`
+  - `GEO_TEST_DATABASE_URL = mysql+pymysql://root:<GEO_DB_PASS>@10.0.0.10:3307/geo_test`
   - `GEO_JWT_SECRET = <任意非空>`
   - 后端测试标 `@pytest.mark.mysql`；`build_test_app(monkeypatch)` 提供 `app.client`（admin JWT cookie）、`create_extra_user(app, name)`；MCP token 测试用 `headers={"X-MCP-Token": "secret"}`。
 - **前端**：无单测框架，门禁 = `pnpm --filter @geo/web typecheck` + `build`。命令用 `-C web` 或绝对路径（worktree cwd 会漂）。

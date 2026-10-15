@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- **只用 GitLab（`hlgit` remote）**：GitHub Actions 从不触发，删除即可，无需保留 workflow_dispatch。
+- **只用 GitLab（`origin` remote）**：GitHub Actions 从不触发，删除即可，无需保留 workflow_dispatch。
 - **不动 MR gate 与 main gate**：`backend-lint` + `frontend` 在 MR / 分支 push（含 main）上必须照旧跑，本次只让 tag 流水线不跑它们。
 - **不碰 `backend-test`**：它当前被整体禁用（job 名前加点），属独立议题，本计划一行都不改。
 - **不改 `ci/deploy.gitlab-ci.yml`**：`build:*` 与 `deploy` 无 `needs:`，靠 stage 顺序执行，前面 job 不实例化时 GitLab 自动跳过空 stage。
@@ -170,7 +170,7 @@ CI（`.github/workflows/ci.yml`，push 到 main 和所有 PR 触发）：**后�
 ```
 替换为：
 ```
-CI（GitLab，`.gitlab-ci.yml`，MR 与分支 push 触发）：硬门禁是 **`backend-lint`（ruff check / ruff format --check / mypy）+ `frontend`（typecheck + build）**；`backend-test`（pytest，`mysql:8.0` service、库 `geo_test`）当前因一个早红的无关测试被整体禁用（job 名前加点隐藏）；`security-audit`（pip-audit）非阻塞、仅 requirements 变更或夜间 schedule 跑。**tag（`base-/server-/web-/release-`）流水线只做构建+部署、不重跑 lint+frontend**（tag 落在已过 main gate 的 commit 上；部署链在 `ci/deploy.gitlab-ci.yml`，设计见 `docs/superpowers/specs/2026-07-10-ci-release-dedup-design.md`）。GitHub Actions 已退役、团队只用 GitLab（`hlgit`）。
+CI（GitLab，`.gitlab-ci.yml`，MR 与分支 push 触发）：硬门禁是 **`backend-lint`（ruff check / ruff format --check / mypy）+ `frontend`（typecheck + build）**；`backend-test`（pytest，`mysql:8.0` service、库 `geo_test`）当前因一个早红的无关测试被整体禁用（job 名前加点隐藏）；`security-audit`（pip-audit）非阻塞、仅 requirements 变更或夜间 schedule 跑。**tag（`base-/server-/web-/release-`）流水线只做构建+部署、不重跑 lint+frontend**（tag 落在已过 main gate 的 commit 上；部署链在 `ci/deploy.gitlab-ci.yml`，设计见 `docs/superpowers/specs/2026-07-10-ci-release-dedup-design.md`）。GitHub Actions 已退役、团队只用 GitLab（`origin`）。
 ```
 
 - [ ] **Step 3: 改 `docs/project/08-testing.md`（86–99 行）**
@@ -192,7 +192,7 @@ MR 与分支 push（含 `main`）触发；纯文档改动不触发；新 push �
 - 当前实际硬门禁 = **`backend-lint` + `frontend`**；`backend-test` 禁用期间无 pytest 兜底。
 - **tag 流水线（`base-/server-/web-/release-`）只跑构建+部署**，不重跑 lint+frontend；部署链见 `ci/deploy.gitlab-ci.yml`。
 - 配合分支保护把 CI 设为 `main` 的 required check，即可"红了不准 merge"。
-- GitHub Actions（原 `.github/workflows/`）已退役，团队只用 GitLab（`hlgit`）。
+- GitHub Actions（原 `.github/workflows/`）已退役，团队只用 GitLab（`origin`）。
 ```
 
 - [ ] **Step 4: 改 `docs/project/10-handover-runbook.md`（22、24 行）**
@@ -203,7 +203,7 @@ MR 与分支 push（含 `main`）触发；纯文档改动不触发；新 push �
 ```
 改为：
 ```
-- [ ] 仓库访问权限（GitLab `hlgit`；GitHub 仅历史备份）已转移/授予
+- [ ] 仓库访问权限（GitLab `origin`；GitHub 仅历史备份）已转移/授予
 ```
 把第 24 行：
 ```
@@ -235,7 +235,7 @@ git add -A CLAUDE.md docs/project/08-testing.md docs/project/10-handover-runbook
 git commit -m "$(cat <<'EOF'
 chore(ci): retire GitHub Actions; docs point CI to GitLab
 
-团队只用 GitLab（hlgit），GitHub workflow 从不触发。删除
+团队只用 GitLab（origin），GitHub workflow 从不触发。删除
 ci.yml + coverage.yml，并把 CLAUDE.md / 08-testing / 10-handover
 三处 CI 描述改回 GitLab 真值（含 tag 流水线只构建部署）。
 

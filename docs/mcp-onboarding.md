@@ -1,7 +1,7 @@
 # GEO MCP 接入指南
 
 让 Claude Code 直接操作 GEO 平台（读写文章 / 生文 / 配图 / 送审 / 分发 / 拉数据）。
-连的是**远端后端** `geo.huanchanghuyu.com`，所以**不需要**本地起后端、数据库或 AI Key。
+连的是**远端后端** `geo.example.com`，所以**不需要**本地起后端、数据库或 AI Key。
 前提：能跑 Python + 能访问该后端 + 有团队 token。
 
 ---
@@ -28,7 +28,7 @@ python -m pip install -r E:\geo\requirements-mcp.txt
   "args": ["-m", "server.mcp"],
   "env": {
     "GEO_MCP_TOKEN": "b602df64a11563377617870174618a5a1b6f8adc06e58c2cd8ee7b1b991a6892",
-    "GEO_API_BASE_URL": "http://geo.huanchanghuyu.com",
+    "GEO_API_BASE_URL": "http://geo.example.com",
     "PYTHONPATH": "E:\\geo"
   }
 }
@@ -49,7 +49,7 @@ python -m pip install -r E:\geo\requirements-mcp.txt
 |---|---|---|
 | `-32000` / `Failed to reconnect` | spawn 的 python 没装 `mcp[cli]` | 回第 2 步，**用 command 里那个 python** 装 |
 | `ModuleNotFoundError: server` | `PYTHONPATH` 没指对仓库根 | 改 env 里的 `PYTHONPATH` |
-| 连上但 tool 调用报 5xx / 超时 | 后端不通 | 查网络 / VPN，确认能访问 `geo.huanchanghuyu.com` |
+| 连上但 tool 调用报 5xx / 超时 | 后端不通 | 查网络 / VPN，确认能访问 `geo.example.com` |
 | 启动即退、提示 token 为空 | 没填 token | 补 env 里的 `GEO_MCP_TOKEN` |
 
 接入前可先单测环境（不依赖后端）：

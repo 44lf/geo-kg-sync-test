@@ -124,7 +124,7 @@ class McpConfig:
             raise RuntimeError("GEO_MCP_TOKEN is empty. Set it in GEO .env or mcpServers env.")
 ```
 
-**为什么不回退到 `api_base_url`**：生产部署 `GEO_API_BASE_URL` 已是公网域名（`http://geo.huanchanghuyu.com`），self-call 绕公网一圈 = 多一次反代 + 多一次 TLS。新字段独立、缺失时强制走 `127.0.0.1:8000`，老配置直接生效，新 env 是可选优化。
+**为什么不回退到 `api_base_url`**：生产部署 `GEO_API_BASE_URL` 已是公网域名（`http://geo.example.com`），self-call 绕公网一圈 = 多一次反代 + 多一次 TLS。新字段独立、缺失时强制走 `127.0.0.1:8000`，老配置直接生效，新 env 是可选优化。
 
 ### 3.3 `server/mcp/tools/*.py` — 单点改动
 

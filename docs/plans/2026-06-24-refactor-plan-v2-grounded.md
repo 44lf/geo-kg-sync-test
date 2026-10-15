@@ -59,7 +59,7 @@
 
 ### 1.7 Git & 部署（探查⑥）
 - **已严格用 Conventional Commits + PR 号**（`fix(tasks): … (#143)`），2~3 个活跃贡献者（44lf 为主，Glen、trkjoy）。
-- 已有 `docs/decomposition-plan-a` 分支 + 第二远程 `hlgit`——团队已在试水拆分。
+- 已有 `docs/decomposition-plan-a` 分支 + 第二远程 `origin`——团队已在试水拆分。
 - **仓库内无 CODEOWNERS / PR 模板**；分支保护在 GitHub 平台侧（"geo" 规则要求 backend+frontend 两个必需检查）。
 - CI：GitHub（主，4 分片并行 pytest）+ GitLab（备，单 runner）。硬门禁：后端 ruff/mypy/pytest、前端 typecheck+build；ESLint `continue-on-error`，安全审计非阻塞；用 `dorny/paths-filter` 跳过纯文档。
 - 部署：docker-compose，**单镜像跑 web+worker 两种进程**（同 `Dockerfile`，启动命令不同）+ nginx + mysql + minio + dailyhot-api(Node)。`app_data` 卷三方共享。

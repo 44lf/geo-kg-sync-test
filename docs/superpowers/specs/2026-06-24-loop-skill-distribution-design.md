@@ -41,7 +41,7 @@ sha256 让本地知道是否需要更新。
 ```
 ┌─────────────────────────────────┐   ┌──────────────────────────────────┐
 │ 浏览器用户                       │   │ Claude Code 用户                  │
-│ https://geo.huanchanghuyu.com/  │   │ /goal 接入指南 → 已配 MCP token   │
+│ https://geo.example.com/  │   │ /goal 接入指南 → 已配 MCP token   │
 └──────────────┬──────────────────┘   └────────────────┬─────────────────┘
                │ user JWT cookie                       │ X-MCP-Token header
                │                                       │
@@ -548,7 +548,7 @@ export async function getLoopSkillBundleInfo(): Promise<LoopSkillBundleInfo> {
 
 | # | 步骤 | 期望 |
 |---|---|---|
-| 1 | 浏览器打开 https://geo.huanchanghuyu.com/ 登录 → MCP 接入 tab | Section ⑤ 显示 |
+| 1 | 浏览器打开 https://geo.example.com/ 登录 → MCP 接入 tab | Section ⑤ 显示 |
 | 2 | 看到 Section ⑤ 顶部版本号 + sha256 + 文件清单 | 都加载出 |
 | 3 | 点 「下载 .zip」 | 浏览器下载 `geo-loop-skills-2026-06-24-v1.zip` |
 | 4 | 解压检查 | 5 个文件在正确路径、跟服务端 templates/ 内容一致 |

@@ -138,7 +138,7 @@
 
 ## 10. 待需求方确认（open items）
 
-1. **Runner 可达性**：`geo-claude-plugins` 的 GitLab runner 能否访问 GEO？`GEO_BASE` 用公网 `geo.huanchanghuyu.com` 还是某内网地址？（A 方案前提，需事实确认。）
+1. **Runner 可达性**：`geo-claude-plugins` 的 GitLab runner 能否访问 GEO？`GEO_BASE` 用公网 `geo.example.com` 还是某内网地址？（A 方案前提，需事实确认。）
 2. **自动 vs 手动闸门**：长期是合 main 自动发（`on_success`），还是保留 `when: manual` 人工确认？（默认：先 manual 灰度 → 转 auto。）
 3. **收纳档位**：确认 (a) 前端折叠够用，暂不做 (b) 自动保留近 N 版？
 4. **覆盖语义**：确认「git 赢、人工手传版会被下次合 main 覆盖」这一语义？（默认认可。）

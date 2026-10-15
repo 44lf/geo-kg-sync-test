@@ -19,7 +19,7 @@
 ## 2. 交接清单
 
 ### 2.1 代码与文档
-- [ ] 仓库访问权限（GitLab `hlgit`；GitHub 仅历史备份）已转移/授予
+- [ ] 仓库访问权限（GitLab `origin`；GitHub 仅历史备份）已转移/授予
 - [ ] `CLAUDE.md`、`docs/AI_GENERATION.md`、`docs/DEPLOYMENT.md`、本 `doc/` 已通读
 - [ ] CI（GitLab `.gitlab-ci.yml` + `ci/deploy.gitlab-ci.yml`）与分支保护设置已知悉
 

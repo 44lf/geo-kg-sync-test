@@ -4,7 +4,7 @@
 > `403/405/429`；Collector 遇到这些状态码会立即停止整轮任务。
 
 Collector 独立仓库：
-`https://hlgit.5518game.com/geo/geo-taptap-collector`。GEO 仓库只维护生产侧目标导出、
+`https://git.example.com/geo/geo-taptap-collector`。GEO 仓库只维护生产侧目标导出、
 bundle 校验和幂等导入。
 
 ## 架构边界
@@ -55,7 +55,7 @@ python -m server.scripts.export_game_backfill_targets \
 先从 GitLab 获取 Collector：
 
 ```powershell
-git clone ssh://git@hlgit.5518game.com:2222/geo/geo-taptap-collector.git
+git clone ssh://git@git.example.com:2222/geo/geo-taptap-collector.git
 cd geo-taptap-collector
 ```
 

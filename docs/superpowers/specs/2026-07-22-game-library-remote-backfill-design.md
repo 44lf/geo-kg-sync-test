@@ -26,7 +26,7 @@
 ## 关键事实（已核实）
 
 - 本地 `e:\geo` 有完整 `game_library` 模块 + `sources/{taptap,baidu}.py`，抓取代码可直接复用。
-- 本地 `.env` 指向 LAN 开发服 `172.25.20.57`（geo_dev / MinIO），**不是生产**。
+- 本地 `.env` 指向 LAN 开发服 `10.0.0.10`（geo_dev / MinIO），**不是生产**。
 - 生产 MySQL/MinIO 端口**未 publish 到宿主**（只在 compose 内网 `mysql:3306` / `minio:9000` 可达）→ 隧道直连方案有容器 IP 漂移 + MinIO URL 一致性坑，故不采用。
 - `refresh_one_game`（`ingest_service.py:226`）的拆分点干净：**抓取+下载字节（254-275，纯联网无 DB）** 与 **`upsert_game` 入库（283-293，纯 DB/MinIO）** 天然两段。
 - 抓取产物 `Game`（`types.py`）是纯 dataclass（基本类型 + list + dict）→ `dataclasses.asdict()` 可直接 JSON 序列化，生产端 `Game(**d)` 还原。

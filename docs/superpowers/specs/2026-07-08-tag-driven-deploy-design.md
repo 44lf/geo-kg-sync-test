@@ -1,15 +1,15 @@
 # Tag 驱动自动部署设计（GEO Collab）
 
 > 日期：2026-07-08 · 状态：设计定稿待实现
-> 关联参考：`.gitlab-ci-hr.yml`（HrSystem 的 tag→kaniko→Harbor→SSH 参考骨架）、`deploy/`（现有手动发布脚本 build.sh/deploy.sh）、`.gitlab-ci.yml`（GEO 现有 CI）
+> 关联参考：`.gitlab-ci-hr.yml`（HrSystem 的 tag→kaniko→Registry→SSH 参考骨架）、`deploy/`（现有手动发布脚本 build.sh/deploy.sh）、`.gitlab-ci.yml`（GEO 现有 CI）
 
 ## 1. 目标与背景
 
-把 GEO 的部署从「本地 `build.sh` 出 tar.gz → 手动 scp → 服务器 `deploy.sh`」升级为 **打 tag 即全自动构建并上线**。复用两套已在本环境验证过的东西：GEO 自己的 `deploy.sh` 部署逻辑，HrSystem 的 tag→kaniko→Harbor→SSH CI 骨架。
+把 GEO 的部署从「本地 `build.sh` 出 tar.gz → 手动 scp → 服务器 `deploy.sh`」升级为 **打 tag 即全自动构建并上线**。复用两套已在本环境验证过的东西：GEO 自己的 `deploy.sh` 部署逻辑，HrSystem 的 tag→kaniko→Registry→SSH CI 骨架。
 
 四条硬约束（用户确认）：
 
-1. **内网 Harbor 不可达外网服务器**：`harbor.5518game.com:6443` 是内网地址，生产服务器在公网、连不到它。必须有「内网→外网」的镜像搬运机制，且不把 Harbor 对公网暴露。
+1. **内网 Registry 不可达外网服务器**：`registry.example.com` 是内网地址，生产服务器在公网、连不到它。必须有「内网→外网」的镜像搬运机制，且不把 Registry 对公网暴露。
 2. **零硬编码**：所有 host / 账号 / 路径都用 CI 变量占位，后续在 GitLab UI（Settings → CI/CD → Variables）配置。
 3. **镜像瘦身**：慢变的基础栈（无头浏览器等）与快变的代码解耦，改代码只重建薄层。
 4. **只更新改动**：改动的部分才重建 / 重传 / 重启，不动的部分不碰。
@@ -42,7 +42,7 @@
 
 ## 2. 关键前提事实
 
-- **GitLab runner 是「桥」**：runner 在内网能连 Harbor，同时又必须 SSH 到外网服务器才能部署 → 天然横跨两侧，是搬运镜像的唯一通道。
+- **GitLab runner 是「桥」**：runner 在内网能连 Registry，同时又必须 SSH 到外网服务器才能部署 → 天然横跨两侧，是搬运镜像的唯一通道。
 - **runner 非特权、无 docker daemon**：HrSystem 已证明本 runner 只能跑 kaniko（用户态构建）+ daemonless 工具；不能 `docker build` / `docker push`。因此搬运用 **skopeo**（无守护进程、blob 级增量）。
 - **两个应用镜像**：`geo-collab-server`（app + worker 共用）和 `geo-collab-web`（nginx 静态 + `/api` 反代 + noVNC）。基础设施 mysql / minio / dailyhot 已是独立容器，不进应用镜像。
 - **生产始终有 nginx 在前**：`docker-compose.prod.yml` 恒含 nginx serve 前端 + 反代，app 不 serve SPA。
@@ -51,7 +51,7 @@
 
 | 维度 | 决策 |
 |---|---|
-| 镜像仓库 | 内网 Harbor 新建 **`geo` 项目** + 独立 robot 机器人账号 |
+| 镜像仓库 | 内网 Registry 新建 **`geo` 项目** + 独立 robot 机器人账号 |
 | 内网→外网搬运 | **skopeo 经 SSH 隔离隧道，增量推入外网服务器本地 `registry:2`（`127.0.0.1:5000`）** |
 | 部署触发 | **全自动**：tag → 构建 → 搬运 → 上线一气到底 |
 | tag 方案 | 分端：`base-<ver>` / `server-<ver>` / `web-<ver>` / `release-<ver>`(=all) |
@@ -128,9 +128,9 @@ worker 内 Playwright 直接拉起本地 Chromium，且 noVNC / x11vnc 必须与
      docker://$HARBOR_REGISTRY/$HARBOR_PROJECT/geo-collab-server:<ver> \
      docker://localhost:5000/$HARBOR_PROJECT/geo-collab-server:<ver>
    ```
-   skopeo 只推目标 registry 缺失的 blob：base 层首次传后常驻，**改代码只过顶层几 MB**。skopeo 会在缺 base 层时自动从 Harbor 拉齐，无需单独搬 base。
+   skopeo 只推目标 registry 缺失的 blob：base 层首次传后常驻，**改代码只过顶层几 MB**。skopeo 会在缺 base 层时自动从 Registry 拉齐，无需单独搬 base。
 
-> skopeo 镜像本身需 runner 可达；若 quay.io 不可达，一次性 seed 进 Harbor geo 项目后从 Harbor 拉。
+> skopeo 镜像本身需 runner 可达；若 quay.io 不可达，一次性 seed 进 Registry geo 项目后从 Registry 拉。
 
 ### 5.3 服务器端拉取（`deploy.sh` registry 模式）
 
@@ -142,14 +142,14 @@ worker 内 Playwright 直接拉起本地 Chromium，且 noVNC / x11vnc 必须与
 ```
 打 tag → GitLab pipeline：
   stage test    复用现有 backend-lint + 前端检查（门禁；后端 pytest 恢复后纳入）
-  stage build   kaniko 构建 → 推内网 Harbor geo 项目
+  stage build   kaniko 构建 → 推内网 Registry geo 项目
   stage bridge  skopeo 经 SSH 隧道增量推入外网服务器 127.0.0.1:5000
   stage deploy  SSH → deploy.sh(registry 模式) → migrate → up -d 变动服务 → 健康检查 → 飞书
 ```
 
 | tag | 构建 | 部署端 | 迁移 |
 |---|---|---|---|
-| `base-<ver>` | geo-collab-base | 不部署（仅推 Harbor 供 server FROM） | — |
+| `base-<ver>` | geo-collab-base | 不部署（仅推 Registry 供 server FROM） | — |
 | `server-<ver>` | geo-collab-server | app + worker | ✅ |
 | `web-<ver>` | geo-collab-web | nginx | ❌ |
 | `release-<ver>` | server + web | all | ✅ |
@@ -162,9 +162,9 @@ worker 内 Playwright 直接拉起本地 Chromium，且 noVNC / x11vnc 必须与
 
 | 变量 | 用途 | 类型 |
 |---|---|---|
-| `HARBOR_REGISTRY` | 如 `harbor.5518game.com:6443` | 普通 |
+| `HARBOR_REGISTRY` | 如 `registry.example.com` | 普通 |
 | `HARBOR_PROJECT` | 如 `geo` | 普通 |
-| `DOCKER_AUTH_CONFIG` | kaniko / skopeo 拉推 Harbor 鉴权 JSON | Masked |
+| `DOCKER_AUTH_CONFIG` | kaniko / skopeo 拉推 Registry 鉴权 JSON | Masked |
 | `HARBOR_USER` / `HARBOR_TOKEN` | geo robot 账号（预留，如脚本内 login 需要） | Masked |
 | `DEPLOY_SSH_HOST` / `DEPLOY_SSH_USER` | 外网生产服务器 | 普通 |
 | `DEPLOY_SSH_KEY` | CI 免密私钥 | File / Masked |
@@ -183,13 +183,13 @@ worker 内 Playwright 直接拉起本地 Chromium，且 noVNC / x11vnc 必须与
 
 1. **迁移失败即熔断**：`migrate` 是 `up -d` 之前的独立一次性服务，`set -euo pipefail` 下非零退出即中止部署，旧容器继续跑，坏迁移不带崩线上。
 2. **部署后健康检查**：`ssh` 内 `curl` 本机 `HTTP_PORT`（N 次重试）；不过 → 飞书告警（复用 `GEO_FEISHU_WEBHOOK_URL`）+ job 判红。
-3. **确定性回滚**：deploy 永远 pin 显式 `<ver>`（不用 latest）；Harbor + 服务器本地 registry 按版本 tag 留旧镜像 → 回滚 = `IMAGE_SOURCE=registry bash deploy.sh server <旧版本>`。⚠️ alembic 不自动降级，回滚涉及 schema 变更需人工评估。
+3. **确定性回滚**：deploy 永远 pin 显式 `<ver>`（不用 latest）；Registry + 服务器本地 registry 按版本 tag 留旧镜像 → 回滚 = `IMAGE_SOURCE=registry bash deploy.sh server <旧版本>`。⚠️ alembic 不自动降级，回滚涉及 schema 变更需人工评估。
 4. 数据 bind 挂载不动，**绝不 `down -v`**、不删 `data/`。
 
 ## 10. 一次性前置（上线前铺一次）
 
-- **Harbor**：建 `geo` 项目 + `robot$geo+ci-rw` 读写机器人账号；生成 `DOCKER_AUTH_CONFIG`。
-- **首次 seed base**：`base-<ver>` tag 跑一遍，确保 Harbor 有 base 供 server 构建 FROM。
+- **Registry**：建 `geo` 项目 + `robot$geo+ci-rw` 读写机器人账号；生成 `DOCKER_AUTH_CONFIG`。
+- **首次 seed base**：`base-<ver>` tag 跑一遍，确保 Registry 有 base 供 server 构建 FROM。
 - **外网服务器（新栈，全程不碰老栈 `geo`/`/root/geo`）**：
   - Docker + Compose v2 已装（老栈在用）；
   - **新建**独立目录 `$DEPLOY_PATH`（如 `/root/geo-collab`，本机无 `/data`）铺新栈 `docker-compose.prod.yml`（项目 `geo-ci`、`registry` 服务、`$HTTP_PORT` 高端口、`geo-ci_*` 独立卷）+ 填好的 `.env` + `deploy.sh`；
@@ -198,12 +198,12 @@ worker 内 Playwright 直接拉起本地 Chromium，且 noVNC / x11vnc 必须与
   - CI `DEPLOY_SSH_KEY` 对应公钥加入 `authorized_keys`（免密）；
   - 确认允许 SSH 本地端口转发（`AllowTcpForwarding yes`，默认开）；
   - **上线前 `df -h` 复核**：根盘仅剩 24G，base 镜像 + registry blob + 新库数据别写满拖垮老栈。
-- **runner**：确认可达 Harbor 与 `public.ecr.aws`、可 SSH 到外网服务器；skopeo 镜像可达（否则 seed 进 Harbor）。
+- **runner**：确认可达 Registry 与 `public.ecr.aws`、可 SSH 到外网服务器；skopeo 镜像可达（否则 seed 进 Registry）。
 
 ## 11. 待补 / 风险
 
 - **`DEPLOY_SSH_HOST` = `47.115.134.13`、`DEPLOY_SSH_USER` = `root`**（值填 GitLab CI 变量，CI 文件内仍用 `$DEPLOY_SSH_HOST` 占位，不硬编码）。新栈独立并行、老栈不动，见 §1.1。
-- **ECR Public 基础镜像 tag 覆盖**：`public.ecr.aws/docker/library` 需含 `python:3.12-slim` / `node:22-bookworm-slim` / `nginx:stable-alpine`；若某 tag 缺失，回退把基础镜像 seed 进 Harbor geo 项目、`BASE_REGISTRY` 指向它。
+- **ECR Public 基础镜像 tag 覆盖**：`public.ecr.aws/docker/library` 需含 `python:3.12-slim` / `node:22-bookworm-slim` / `nginx:stable-alpine`；若某 tag 缺失，回退把基础镜像 seed 进 Registry geo 项目、`BASE_REGISTRY` 指向它。
 - **首次 base 传输 ~2GB**：第一次 `server-*`/`release-*` 部署会把 base 全量层传到服务器本地 registry（一次性），之后代码更新才增量。可先手动跑一次 base 搬运预热。磁盘只剩 24G，注意别塞满。
 - **单 runner 串行**：build+bridge+deploy 占用唯一 runner 较久；发版时段避免与日常流水线抢。
 - **新栈用什么域名/入口对外**：新 nginx 绑高端口（如 8081）先内部验证；若要正式对外（域名/HTTPS），后续再决定是否接老栈的 `geo-https-nginx` 或另配。不阻塞本方案。

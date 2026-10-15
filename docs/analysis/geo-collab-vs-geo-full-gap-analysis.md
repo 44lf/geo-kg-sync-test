@@ -177,7 +177,7 @@ geo-full 的 6 阶段路线图（Section 8）假设大部分东西从零建。�
 | 🔴 高 | **三份内容并行存储手动同步** | `Article.content_json/html/plain_text`，[articles/service.py](../server/app/modules/articles/service.py) | 随着 GEO 优化节点、审核节点、多平台改写版增多，写正文的路径会爆炸式增长，手动三同步会变成**正确性炸弹**。应收敛为单一真源 + 派生。 |
 | 🟡 中 | **plain_text 直接存原始 Markdown** | [pipeline.py:107](../server/app/modules/ai_generation/pipeline.py#L107)（注释「简化」） | 发布纯文本里残留 `#`/`**` 等标记，**直接伤发布质量**——而监测/归因恰恰在度量发布质量，脏数据会污染整条归因链。早修。 |
 | 🟡 中 | **数据栈 MySQL only vs 时序需求** | `core/config.py`、`alembic` | L1 监测是时序密集型，愿景建议 TimescaleDB（D6.1）。MySQL 能扛但非最优。**在 L1 设计期必须拍板**：扩展 MySQL 还是引入专用时序库。 |
-| 🟢 低 | **README 仍是 GitLab 默认模板** | `README.md` | 指向 `hlgit.5518game.com`，但已迁 GitHub Actions。对新成员误导，CLAUDE.md 才是事实源。本周可改。 |
+| 🟢 低 | **README 仍是 GitLab 默认模板** | `README.md` | 指向 `git.example.com`，但已迁 GitHub Actions。对新成员误导，CLAUDE.md 才是事实源。本周可改。 |
 | 🟢 低 | **`openai==2.38.0` 显式钉入依赖** | `requirements.txt` + [pipeline.py:_inject_api_key](../server/app/modules/ai_generation/pipeline.py#L221) | 与「全走 LiteLLM、不 import openai/anthropic SDK」的规则张力；虽是 litellm 传递依赖，但显式 pin + 同时注入两个 env key 易误导。加注释澄清即可。 |
 | 🟢 低 | **`require_local_token()` 死代码** | `core/security.py` | 已知死代码，清理。 |
 

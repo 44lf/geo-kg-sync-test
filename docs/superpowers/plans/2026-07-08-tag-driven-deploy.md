@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 打 tag → GitLab CI kaniko 构建 → 推内网 Harbor `geo` 项目 → skopeo 经 SSH 隧道增量搬入外网服务器本地 `registry:2` → `deploy.sh` registry 模式上线；作为独立并行栈 `geo-ci`，与线上老栈 `geo` 完全隔离。
+**Goal:** 打 tag → GitLab CI kaniko 构建 → 推内网 Registry `geo` 项目 → skopeo 经 SSH 隧道增量搬入外网服务器本地 `registry:2` → `deploy.sh` registry 模式上线；作为独立并行栈 `geo-ci`，与线上老栈 `geo` 完全隔离。
 
 **Architecture:** 镜像基础分层（`geo-collab-base` 慢层 + `geo-collab-server` 薄代码层）；CI 非特权 kaniko 构建、skopeo daemonless 增量搬运；服务器端复用并扩展 `deploy/deploy.sh`（新增 `IMAGE_SOURCE=registry` 拉取模式），一次性 `migrate` 服务单点迁移，健康检查 + 飞书告警。
 
-**Tech Stack:** GitLab CI（self-hosted hlgit）、kaniko（用户态构建）、Harbor（内网私仓）、skopeo（增量搬运）、`registry:2`（服务器本地仓）、Docker Compose v2、bash。
+**Tech Stack:** GitLab CI（self-hosted origin）、kaniko（用户态构建）、Registry（内网私仓）、skopeo（增量搬运）、`registry:2`（服务器本地仓）、Docker Compose v2、bash。
 
 ## Global Constraints
 
@@ -17,7 +17,7 @@
 - CI 变量（GitLab → Settings → CI/CD → Variables）：`HARBOR_REGISTRY`、`HARBOR_PROJECT`、`DOCKER_AUTH_CONFIG`(Masked)、`HARBOR_USER`/`HARBOR_TOKEN`(Masked)、`DEPLOY_SSH_HOST`、`DEPLOY_SSH_USER`、`DEPLOY_SSH_KEY`(File)、`DEPLOY_PATH`、`LOCAL_REGISTRY`、`BASE_REGISTRY`、`GEO_FEISHU_WEBHOOK_URL`。
 - **kaniko 基础镜像源**：build-arg `BASE_REGISTRY`，CI 传 `public.ecr.aws/docker/library`，本地默认 `docker.io/library`。
 - tag → 端：`base-<ver>`(仅建 base) / `server-<ver>`(app+worker,迁移) / `web-<ver>`(nginx,不迁移) / `release-<ver>`(=all)。版本号取 tag 后缀。
-- 参考蓝本：`.gitlab-ci-hr.yml`（HrSystem 的 kaniko+Harbor+SSH deploy）、`deploy/dist/*`（现有 build.sh/deploy.sh/compose，本方案在其基础上演进）。
+- 参考蓝本：`.gitlab-ci-hr.yml`（HrSystem 的 kaniko+Registry+SSH deploy）、`deploy/dist/*`（现有 build.sh/deploy.sh/compose，本方案在其基础上演进）。
 - 设计依据：`docs/superpowers/specs/2026-07-08-tag-driven-deploy-design.md`。
 
 ---
@@ -30,7 +30,7 @@
 | Phase 2 | 新栈 compose + `.env.example` + `VERSION` | 否（repo） |
 | Phase 3 | `deploy.sh` 加 `IMAGE_SOURCE=registry` 拉取模式 + `build.sh` 加 base 构建 | 否（repo） |
 | Phase 4 | `ci/deploy.gitlab-ci.yml` + `.gitlab-ci.yml` 接线（tag 触发 + include） | 否（repo，CI lint 验证） |
-| Phase 5 | Harbor `geo` 项目 + robot 账号 + GitLab CI 变量 | 否（Harbor/GitLab UI） |
+| Phase 5 | Registry `geo` 项目 + robot 账号 + GitLab CI 变量 | 否（Registry/GitLab UI） |
 | Phase 6 | 服务器一次性铺底：新目录 + `.env` + registry + dailyhot（**逐步确认**） | **是（确认）** |
 | Phase 7 | 端到端：`base-*` 预热 → `release-*` 首发 → 验证高端口访问 + 健康检查 | **是（确认）** |
 
@@ -641,7 +641,7 @@ deploy:
       fi
 ```
 
-> skopeo 镜像 `skopeo-stable` 与 kaniko 镜像同样需 seed 进 Harbor（Phase 5）。`--src-authfile` 用 kaniko 同款 config.json。
+> skopeo 镜像 `skopeo-stable` 与 kaniko 镜像同样需 seed 进 Registry（Phase 5）。`--src-authfile` 用 kaniko 同款 config.json。
 
 - [ ] **Step 2: 用 GitLab CI lint API 校验（真验证）**
 
@@ -699,7 +699,7 @@ Run（PowerShell）：
 ```powershell
 $tok = ((Get-Content .env | ? {$_ -match '^GITLAB_TOKEN='}) -replace '^GITLAB_TOKEN=','').Trim()
 $body = @{ content = (Get-Content .gitlab-ci.yml -Raw) } | ConvertTo-Json
-Invoke-RestMethod -Uri "https://hlgit.5518game.com/api/v4/projects/30/ci/lint" -Method Post -Headers @{'PRIVATE-TOKEN'=$tok} -ContentType 'application/json' -Body $body | Select-Object valid,errors
+Invoke-RestMethod -Uri "https://git.example.com/api/v4/projects/30/ci/lint" -Method Post -Headers @{'PRIVATE-TOKEN'=$tok} -ContentType 'application/json' -Body $body | Select-Object valid,errors
 ```
 Expected: `valid : True`，`errors` 为空。若 `valid False` → 按 errors 修 YAML 后重跑。
 > 注：项目级 `ci/lint` 会合并 include 文件一起校验。
@@ -713,19 +713,19 @@ git commit -m "feat(ci): wire tag-driven deploy (workflow rules + stages + inclu
 
 ---
 
-## Phase 5 — Harbor 与 GitLab 变量（Harbor/GitLab UI，无服务器影响）
+## Phase 5 — Registry 与 GitLab 变量（Registry/GitLab UI，无服务器影响）
 
-### Task 10: 建 Harbor `geo` 项目 + robot 账号 + seed 工具镜像
+### Task 10: 建 Registry `geo` 项目 + robot 账号 + seed 工具镜像
 
-**Files:** 无（Harbor UI / API 操作，记录到 `deploy/README.md`）
+**Files:** 无（Registry UI / API 操作，记录到 `deploy/README.md`）
 
-- [ ] **Step 1: Harbor 建项目 + robot（找用户在 Harbor UI 操作或提供 admin 凭据）**
+- [ ] **Step 1: Registry 建项目 + robot（找用户在 Registry UI 操作或提供 admin 凭据）**
   - 新建项目 `geo`。
   - 新建 robot 账号 `robot$geo+ci-rw`，权限 push+pull。
   - 生成 `DOCKER_AUTH_CONFIG`：`{"auths":{"<HARBOR_REGISTRY>":{"auth":"<base64(robot:token)>"}}}`。
 
-- [ ] **Step 2: seed 工具镜像到 `geo` 项目**（runner 需从 Harbor 拉 kaniko/skopeo）
-  在一台能连 Docker Hub / quay 且能 push Harbor 的机器：
+- [ ] **Step 2: seed 工具镜像到 `geo` 项目**（runner 需从 Registry 拉 kaniko/skopeo）
+  在一台能连 Docker Hub / quay 且能 push Registry 的机器：
   ```bash
   docker pull gcr.io/kaniko-project/executor:v1.23.2-debug   # 或从可达源
   docker tag  gcr.io/kaniko-project/executor:v1.23.2-debug $HARBOR_REGISTRY/geo/kaniko-executor:v1.23.2-debug
@@ -742,7 +742,7 @@ git commit -m "feat(ci): wire tag-driven deploy (workflow rules + stages + inclu
 - [ ] **Step 3: 提交 README 记录**
   ```bash
   git add deploy/README.md
-  git commit -m "docs(deploy): Harbor geo project + robot + seed images notes"
+  git commit -m "docs(deploy): Registry geo project + robot + seed images notes"
   ```
 
 ### Task 11: 配置 GitLab CI/CD 变量
@@ -808,13 +808,13 @@ git commit -m "feat(ci): wire tag-driven deploy (workflow rules + stages + inclu
 
 - [ ] **Step 1: bump `deploy/VERSION` 的 BASE，打 tag**
   ```bash
-  git tag base-1.0.0 && git push deploy base-1.0.0    # deploy=hlgit
+  git tag base-1.0.0 && git push deploy base-1.0.0    # deploy=origin
   ```
-  **先与用户确认**（会触发 CI kaniko 构建 base 推 Harbor，占 runner ~构建时长）。
+  **先与用户确认**（会触发 CI kaniko 构建 base 推 Registry，占 runner ~构建时长）。
 
 - [ ] **Step 2: 观察 CI**
-  GitLab pipeline `build:base` 绿 → Harbor `geo/geo-collab-base:1.0.0` 存在。
-  Expected: 构建成功、Harbor 有镜像。失败按日志修 Dockerfile.base / BASE_REGISTRY。
+  GitLab pipeline `build:base` 绿 → Registry `geo/geo-collab-base:1.0.0` 存在。
+  Expected: 构建成功、Registry 有镜像。失败按日志修 Dockerfile.base / BASE_REGISTRY。
 
 ### Task 15: 打 `release-*` 首次全量发新栈
 
@@ -841,6 +841,6 @@ git commit -m "feat(ci): wire tag-driven deploy (workflow rules + stages + inclu
 ## Self-Review 记录
 
 - **Spec 覆盖**：§4 镜像分层→Task 1-3；§5 registry/skopeo→Task 4/8/6；§6 tag 映射→Task 8-9；§7 变量→Task 11；§8 接线→Task 9；§9 安全网（迁移熔断=deploy.sh set -e + migrate 独立；健康检查=Task 6 Step3 + Task 8 deploy；飞书=Task 8 after_script；回滚=pin 版本，README 记录）；§10 前置→Task 10-13；§1.1 非冲突→Task 4/5/13 全程 geo-ci 隔离。
-- **回滚**：改 `deploy/VERSION` 旧版本重打 `server-<旧>`/`release-<旧>`；Harbor + 本地 registry 留旧版本层。alembic 不自动降级——回滚涉及 schema 变更需人工评估（写入 deploy/README.md）。
+- **回滚**：改 `deploy/VERSION` 旧版本重打 `server-<旧>`/`release-<旧>`；Registry + 本地 registry 留旧版本层。alembic 不自动降级——回滚涉及 schema 变更需人工评估（写入 deploy/README.md）。
 - **占位符扫描**：无 TBD/TODO；服务器敏感值走确认或用户填，非占位。
 - **已知取舍**：新栈用 bind 挂载 `./data/`（非命名卷）实现与老栈隔离，与 spec §1.1「geo-ci_* 卷」等价（隔离目的一致），deploy.sh 已按 `./data/` 预建目录。

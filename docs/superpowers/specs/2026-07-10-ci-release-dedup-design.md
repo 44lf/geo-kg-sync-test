@@ -9,7 +9,7 @@
 当前 CI 现状（基于 `.gitlab-ci.yml`、`ci/deploy.gitlab-ci.yml`、`.github/workflows/*` 的实际 rules）：
 
 1. **同一份代码的 `backend-lint` + `frontend` 门禁被跑了 3 遍**：MR 流水线 → 合并进 main 的 push 流水线 → 打 tag 的发版流水线。其中 **tag 那一遍是纯重复**——release tag 永远打在"已经过完 main gate 的那个 main commit"上，树与 main gate 时完全一致。
-2. **仓库挂着两套 CI，但团队只用 GitLab（`hlgit`）**。GitHub Actions（`.github/workflows/ci.yml` + `coverage.yml`）只在 push 到 GitHub / 在 GitHub 开 PR 时触发，而这在当前工作流里从不发生——是永不触发的死配置，还让"CI 门禁在哪"产生歧义（多处文档仍指向 GitHub）。
+2. **仓库挂着两套 CI，但团队只用 GitLab（`origin`）**。GitHub Actions（`.github/workflows/ci.yml` + `coverage.yml`）只在 push 到 GitHub / 在 GitHub 开 PR 时触发，而这在当前工作流里从不发生——是永不触发的死配置，还让"CI 门禁在哪"产生歧义（多处文档仍指向 GitHub）。
 
 ### 为什么 tag 那遍是冗余、而 main 那遍不是
 

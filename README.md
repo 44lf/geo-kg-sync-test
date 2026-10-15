@@ -24,7 +24,7 @@ Geo 是一个面向内容运营的多平台内容自动化发布平台：运营�
 | 自动化 | Playwright、Xvfb、x11vnc、websockify、noVNC |
 | AI | LiteLLM、LangGraph、Claude Code MCP Loop |
 | 存储 | MinIO、本地 `GEO_DATA_DIR` |
-| 部署 | Docker Compose、GitLab CI |
+| 部署 | Docker Compose |
 
 ## 目录结构
 
@@ -33,8 +33,6 @@ server/          FastAPI 应用、领域模块、MCP tools、worker、测试
 web/             React + Vite 前端
 docs/            项目文档、设计稿、计划与调研
 claude-loops/    Claude Code Loop 配方
-ci/              GitLab CI / 部署流水线片段
-deploy/          部署辅助文件
 scripts/         维护脚本
 ```
 
@@ -150,6 +148,6 @@ pnpm --filter @geo/web format:check
 - [`docs/DEPLOYMENT.md`](./docs/DEPLOYMENT.md)：部署与运维说明。
 - [`CHANGELOG.md`](./CHANGELOG.md)：重要版本变更记录。
 
-## CI 与发布
+## 质量门禁
 
-项目使用 GitLab CI。MR / 分支 push 的硬门禁包括后端 lint / format / mypy，以及前端 typecheck / build。发版 tag 必须落在 `main` 上；tag 流水线只做构建与部署，不重跑常规门禁。
+提交与合并请求的硬门禁包括后端 `ruff check` / `ruff format --check` / `mypy`，以及前端 `typecheck` / `build`。发布请保证部署的 commit 已落在 `main` 上。

@@ -98,7 +98,7 @@ MR 与分支 push（含 `main`）触发；纯文档改动不触发；新 push �
 - 当前实际硬门禁 = **`backend-lint` + `frontend`**；`backend-test` 禁用期间无 pytest 兜底。
 - **tag 流水线（`base-/server-/web-/release-`）只跑构建+部署**，不重跑 lint+frontend；部署链见 `ci/deploy.gitlab-ci.yml`。
 - 配合分支保护把 CI 设为 `main` 的 required check，即可"红了不准 merge"。
-- GitHub Actions（原 `.github/workflows/`）已退役，团队只用 GitLab（`hlgit`）。
+- GitHub Actions（原 `.github/workflows/`）已退役，团队只用 GitLab（`origin`）。
 
 ---
 
