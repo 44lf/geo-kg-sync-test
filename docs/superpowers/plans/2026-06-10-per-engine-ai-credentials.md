@@ -439,7 +439,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 # 可选写作引擎列表（JSON 数组）。下拉「模型」从这里取；每项自带 api_key/base_url，
 # 选哪个就用哪个的凭据，无需改上面的 GEO_AI_MODEL/GEO_AI_API_KEY。
 # model 空=用 GEO_AI_MODEL；api_key 空=回落 GEO_AI_API_KEY；base_url 仅 OpenAI 兼容网关需要。
-# GEO_AI_ENGINES=[{"label":"Claude","model":"claude-3-5-sonnet-20241022","api_key":"sk-ant-…"},{"label":"DeepSeek","model":"deepseek/deepseek-chat","api_key":"sk-…"},{"label":"公司网关","model":"openai/gpt-4o","api_key":"sk-…","base_url":"https://oneapi.mycorp/v1"}]
+# GEO_AI_ENGINES=[{"label":"Claude","model":"claude-3-5-sonnet-20241022","api_key":"sk-ant-…"},{"label":"DeepSeek","model":"deepseek/deepseek-chat","api_key":"sk-…"},{"label":"自建网关","model":"openai/gpt-4o","api_key":"sk-…","base_url":"https://oneapi.mycorp/v1"}]
 ```
 
 - [ ] **Step 2: 更新 `CLAUDE.md`**

@@ -57,7 +57,7 @@ ai_engines: list[AiEngineConfig] = [AiEngineConfig(label="默认写作模型")] 
 GEO_AI_ENGINES='[
   {"label":"Claude Sonnet","model":"claude-3-5-sonnet-20241022","api_key":"sk-ant-..."},
   {"label":"DeepSeek","model":"deepseek/deepseek-chat","api_key":"sk-deepseek-..."},
-  {"label":"公司网关","model":"openai/gpt-4o","api_key":"sk-xxx","base_url":"https://oneapi.mycorp/v1"}
+  {"label":"自建网关","model":"openai/gpt-4o","api_key":"sk-xxx","base_url":"https://oneapi.mycorp/v1"}
 ]'
 ```
 
